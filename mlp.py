@@ -21,7 +21,7 @@ def parse_args():
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-0.5B-Instruct")
     parser.add_argument("--corpus", type=str, default=None)
     parser.add_argument("--save_prefix", type=str, default="datastore")
-    parser.add_argument("--max_length", type=int, default=256)
+    parser.add_argument("--max_length", type=int, default=1024)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--K", type=int, default=64)
@@ -42,14 +42,34 @@ def parse_args():
 # Corpus
 # =========================================================
 
+def split_text(input_str, max_length):
+    result = []
+    current_chunk = ""
+    for char in input_str:
+        current_chunk += char
+        if char == '。':
+            if len(current_chunk) >= max_length:
+                result.append(current_chunk)
+                current_chunk = ""
+        elif len(current_chunk) >= max_length:
+            last_period_index = current_chunk.rfind('。')
+            if last_period_index != -1:
+                result.append(current_chunk[:last_period_index + 1])
+                current_chunk = current_chunk[last_period_index + 1:]
+    if current_chunk:
+        result.append(current_chunk)
+    return result
+
 def load_text_corpus(path, tokenizer, max_length):
     with open(path, "r", encoding="utf-8") as f:
         text = f.read()
-    tokens = tokenizer(text, return_tensors="pt",
-                       truncation=False)["input_ids"][0]
+    text_chunks = split_text(text, max_length)
     chunks = []
-    for i in range(0, len(tokens) - max_length - 1, max_length):
-        chunks.append(tokens[i:i+max_length+1])
+    for tc in text_chunks:
+        ids = tokenizer(tc, return_tensors="pt",
+                        truncation=False)["input_ids"][0]
+        if len(ids) >= 2:
+            chunks.append(ids)
     return chunks
 
 
