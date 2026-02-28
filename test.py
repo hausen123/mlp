@@ -10,7 +10,7 @@ from mlp import (
     MLPMemory,
 )
 
-MODEL_NAME = "Qwen/Qwen2.5-0.5B"
+MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
 CORPUS_PATH = "kangaekata.txt"
 SAVE_PREFIX = "test_ds"
 PROMPT = "原子力発電所の耐震設計において"

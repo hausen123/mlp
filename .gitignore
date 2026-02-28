@@ -2,3 +2,7 @@ input.txt
 .venv/
 __pycache__/
 *.pyc
+*.npy
+*.pt
+*.txt
+*.pdf

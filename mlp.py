@@ -16,7 +16,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 def parse_args():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-0.5B")
+    parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-0.5B-Instruct")
     parser.add_argument("--corpus", type=str, default=None)
 
     parser.add_argument("--save_prefix", type=str, default="datastore")
