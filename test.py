@@ -35,9 +35,9 @@ def load_model():
     model.eval()
     return model, tokenizer, device
 
-def step1(model, tokenizer, device):
+def step1(model, tokenizer, device, prompt):
     print("\n=== Step 1: Base inference ===")
-    out = inference(model, tokenizer, PROMPT, MAX_NEW_TOKENS, device)
+    out = inference(model, tokenizer, prompt, MAX_NEW_TOKENS, device)
     print(out)
 
 def step2(model, tokenizer, device, target_layer_index):
@@ -56,11 +56,11 @@ def step4(model, device):
     print("\n=== Step 4: Train MLP ===")
     return train_mlp(model, SAVE_PREFIX, ALPHA, BATCH_SIZE, EPOCHS, device)
 
-def step5(model, tokenizer, mlp, device, target_layer_index):
+def step5(model, tokenizer, mlp, device, target_layer_index, prompt):
     print("\n=== Step 5: Inference with MLP ===")
     out = inference_mlp(
         model, tokenizer, mlp,
-        PROMPT, target_layer_index,
+        prompt, target_layer_index,
         LAMBDA_INTERP, MAX_NEW_TOKENS, device,
     )
     print(out)
@@ -69,6 +69,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--step", type=int, default=0,
                         help="実行するステップ (1-5)。省略時は全ステップ実行")
+    parser.add_argument("--prompt", type=str, default=PROMPT,
+                        help="推論プロンプト (step 1, 5 で使用)")
     args = parser.parse_args()
     model, tokenizer, device = load_model()
     num_layers = model.config.num_hidden_layers
@@ -76,7 +78,7 @@ def main():
     print(f"Target layer: {target_layer_index} / {num_layers}")
     run_all = args.step == 0
     if run_all or args.step == 1:
-        step1(model, tokenizer, device)
+        step1(model, tokenizer, device, args.prompt)
     if run_all or args.step == 2:
         step2(model, tokenizer, device, target_layer_index)
     if run_all or args.step == 3:
@@ -90,7 +92,7 @@ def main():
             embed_weight = model.get_input_embeddings().weight.detach()
             mlp = MLPMemory(hidden_dim, embed_weight).to(device)
             mlp.load_state_dict(torch.load("mlp_memory.pt"))
-        step5(model, tokenizer, mlp, device, target_layer_index)
+        step5(model, tokenizer, mlp, device, target_layer_index, args.prompt)
 
 if __name__ == "__main__":
     main()

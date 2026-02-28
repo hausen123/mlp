@@ -34,6 +34,9 @@ def parse_args():
     parser.add_argument("--mode", type=str, default="full",
                         choices=["build", "knn", "train", "infer", "full"])
 
+    parser.add_argument("--prompt", type=str,
+                        default="Transformerの仕組みを説明してください。")
+
     return parser.parse_args()
 
 
@@ -435,16 +438,14 @@ def main():
             mlp = MLPMemory(hidden_dim, embed_weight).to(device)
             mlp.load_state_dict(torch.load("mlp_memory.pt"))
 
-        prompt = "Transformerの仕組みを説明してください。"
-
         print("\n=== Base LM ===")
         print(inference(model, tokenizer,
-                        prompt, 50, device))
+                        args.prompt, 50, device))
 
         print("\n=== MLP Memory ===")
         print(inference_mlp(model, tokenizer,
                             mlp,
-                            prompt,
+                            args.prompt,
                             target_layer_index,
                             args.lambda_interp,
                             50,
