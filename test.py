@@ -52,9 +52,22 @@ def step3():
     print("\n=== Step 3: kNN targets ===")
     compute_knn_targets(SAVE_PREFIX, K, TAU)
 
-def step4(model, device):
+def step4(model, device, target_layer_index):
     print("\n=== Step 4: Train MLP ===")
-    return train_mlp(model, SAVE_PREFIX, ALPHA, BATCH_SIZE, EPOCHS, device)
+    config = {
+        "model_name": MODEL_NAME,
+        "hidden_dim": model.config.hidden_size,
+        "target_layer_index": target_layer_index,
+        "save_prefix": SAVE_PREFIX,
+        "max_length": MAX_LENGTH,
+        "K": K,
+        "tau": TAU,
+        "alpha": ALPHA,
+        "lambda_interp": LAMBDA_INTERP,
+        "batch_size": BATCH_SIZE,
+        "epochs": EPOCHS,
+    }
+    return train_mlp(model, SAVE_PREFIX, ALPHA, BATCH_SIZE, EPOCHS, device, config=config)
 
 def step5(model, tokenizer, mlp, device, target_layer_index, prompt):
     print("\n=== Step 5: Inference with MLP ===")
@@ -85,13 +98,22 @@ def main():
         step3()
     mlp = None
     if run_all or args.step == 4:
-        mlp = step4(model, device)
+        mlp = step4(model, device, target_layer_index)
     if run_all or args.step == 5:
         if mlp is None:
-            hidden_dim = model.config.hidden_size
+            checkpoint = torch.load("mlp_memory.pt", weights_only=False)
+            if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+                config = checkpoint["config"]
+                print("Loaded config:", config)
+                hidden_dim = config.get("hidden_dim", model.config.hidden_size)
+                target_layer_index = config.get("target_layer_index", target_layer_index)
+                state_dict = checkpoint["state_dict"]
+            else:
+                hidden_dim = model.config.hidden_size
+                state_dict = checkpoint
             embed_weight = model.get_input_embeddings().weight.detach()
             mlp = MLPMemory(hidden_dim, embed_weight).to(device)
-            mlp.load_state_dict(torch.load("mlp_memory.pt"))
+            mlp.load_state_dict(state_dict)
         step5(model, tokenizer, mlp, device, target_layer_index, args.prompt)
 
 if __name__ == "__main__":

@@ -218,7 +218,7 @@ def collate_fn(batch):
 
 def train_mlp(model, save_prefix,
               alpha, batch_size,
-              epochs, device):
+              epochs, device, config=None):
 
     dataset = MLPMemoryDataset(save_prefix)
     loader = DataLoader(dataset,
@@ -279,7 +279,10 @@ def train_mlp(model, save_prefix,
 
         print(f"Epoch {epoch+1}: {total_loss/len(loader)}")
 
-    torch.save(mlp.state_dict(), "mlp_memory.pt")
+    torch.save({
+        "state_dict": mlp.state_dict(),
+        "config": config or {},
+    }, "mlp_memory.pt")
     print("MLP saved.")
 
     return mlp
@@ -426,22 +429,45 @@ def main():
     mlp = None
 
     if args.mode in ["train", "full"]:
+        config = {
+            "model_name": args.model_name,
+            "hidden_dim": model.config.hidden_size,
+            "target_layer_index": target_layer_index,
+            "save_prefix": args.save_prefix,
+            "max_length": args.max_length,
+            "K": args.K,
+            "tau": args.tau,
+            "alpha": args.alpha,
+            "lambda_interp": args.lambda_interp,
+            "batch_size": args.batch_size,
+            "epochs": args.epochs,
+        }
         mlp = train_mlp(
             model,
             args.save_prefix,
             args.alpha,
             args.batch_size,
             args.epochs,
-            device
+            device,
+            config=config,
         )
 
     if args.mode in ["infer", "full"]:
 
         if mlp is None:
-            hidden_dim = model.config.hidden_size
+            checkpoint = torch.load("mlp_memory.pt", weights_only=False)
+            if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+                config = checkpoint["config"]
+                print("Loaded config:", config)
+                hidden_dim = config["hidden_dim"]
+                target_layer_index = config["target_layer_index"]
+                state_dict = checkpoint["state_dict"]
+            else:
+                hidden_dim = model.config.hidden_size
+                state_dict = checkpoint
             embed_weight = model.get_input_embeddings().weight.detach()
             mlp = MLPMemory(hidden_dim, embed_weight).to(device)
-            mlp.load_state_dict(torch.load("mlp_memory.pt"))
+            mlp.load_state_dict(state_dict)
 
         print("\n=== Base LM ===")
         print(inference(model, tokenizer,
