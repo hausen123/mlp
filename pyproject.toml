@@ -9,4 +9,5 @@ dependencies = [
     "tqdm",
     "numpy",
     "accelerate",
+    "safetensors",
 ]

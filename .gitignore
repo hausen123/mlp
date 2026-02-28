@@ -4,5 +4,7 @@ __pycache__/
 *.pyc
 *.npy
 *.pt
+*.safetensors
 *.txt
 *.pdf
+model/

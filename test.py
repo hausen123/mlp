@@ -1,4 +1,5 @@
 import argparse
+import glob
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from mlp import (
@@ -14,7 +15,7 @@ MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
 CORPUS_PATH = "kangaekata.txt"
 SAVE_PREFIX = "test_ds"
 PROMPT = "原子力発電所の耐震設計において"
-MAX_NEW_TOKENS = 128
+MAX_NEW_TOKENS = 1024
 MAX_LENGTH = 256
 K = 64
 TAU = 10.0
@@ -54,27 +55,20 @@ def step3():
 
 def step4(model, device, target_layer_index):
     print("\n=== Step 4: Train MLP ===")
-    config = {
-        "model_name": MODEL_NAME,
-        "hidden_dim": model.config.hidden_size,
-        "target_layer_index": target_layer_index,
-        "save_prefix": SAVE_PREFIX,
-        "max_length": MAX_LENGTH,
-        "K": K,
-        "tau": TAU,
-        "alpha": ALPHA,
-        "lambda_interp": LAMBDA_INTERP,
-        "batch_size": BATCH_SIZE,
-        "epochs": EPOCHS,
-    }
-    return train_mlp(model, SAVE_PREFIX, ALPHA, BATCH_SIZE, EPOCHS, device, config=config)
+    return train_mlp(
+        model, SAVE_PREFIX, ALPHA, BATCH_SIZE, EPOCHS, device,
+        model_name=MODEL_NAME,
+        target_layer_index=target_layer_index,
+        lambda_interp=LAMBDA_INTERP,
+        K=K, tau=TAU, max_length=MAX_LENGTH,
+    )
 
 def step5(model, tokenizer, mlp, device, target_layer_index, prompt):
     print("\n=== Step 5: Inference with MLP ===")
     out = inference_mlp(
         model, tokenizer, mlp,
         prompt, target_layer_index,
-        LAMBDA_INTERP, MAX_NEW_TOKENS, device,
+        mlp.config.lambda_interp, MAX_NEW_TOKENS, device,
     )
     print(out)
 
@@ -97,23 +91,19 @@ def main():
     if run_all or args.step == 3:
         step3()
     mlp = None
+    save_dir = None
     if run_all or args.step == 4:
-        mlp = step4(model, device, target_layer_index)
+        mlp, save_dir = step4(model, device, target_layer_index)
     if run_all or args.step == 5:
         if mlp is None:
-            checkpoint = torch.load("mlp_memory.pt", weights_only=False)
-            if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
-                config = checkpoint["config"]
-                print("Loaded config:", config)
-                hidden_dim = config.get("hidden_dim", model.config.hidden_size)
-                target_layer_index = config.get("target_layer_index", target_layer_index)
-                state_dict = checkpoint["state_dict"]
-            else:
-                hidden_dim = model.config.hidden_size
-                state_dict = checkpoint
+            model_dirs = sorted(glob.glob("model/*/"), reverse=True)
+            if not model_dirs:
+                raise RuntimeError("No saved model found in model/. Run step 4 first.")
+            save_dir = model_dirs[0].rstrip("/")
+            print(f"Loading from {save_dir}")
             embed_weight = model.get_input_embeddings().weight.detach()
-            mlp = MLPMemory(hidden_dim, embed_weight).to(device)
-            mlp.load_state_dict(state_dict)
+            mlp = MLPMemory.from_pretrained(save_dir, embed_weight).to(device)
+            target_layer_index = mlp.config.target_layer_index
         step5(model, tokenizer, mlp, device, target_layer_index, args.prompt)
 
 if __name__ == "__main__":
