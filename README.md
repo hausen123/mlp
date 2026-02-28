@@ -68,6 +68,7 @@ uv run python test.py --step 5 --prompt "任意のプロンプト"  # MLP Memory
 | `--lambda_interp` | `0.45` | 推論時の MLP 補間係数 |
 | `--mode` | `full` | `build` / `knn` / `train` / `infer` / `full` |
 | `--prompt` | `Transformerの仕組みを...` | 推論プロンプト |
+| `--max_new_tokens` | `1024` | 推論時の最大生成トークン数 |
 
 ### test.py
 

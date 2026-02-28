@@ -37,6 +37,8 @@ def parse_args():
     parser.add_argument("--prompt", type=str,
                         default="Transformerの仕組みを説明してください。")
 
+    parser.add_argument("--max_new_tokens", type=int, default=1024)
+
     return parser.parse_args()
 
 
@@ -440,7 +442,7 @@ def main():
 
         print("\n=== Base LM ===")
         print(inference(model, tokenizer,
-                        args.prompt, 50, device))
+                        args.prompt, args.max_new_tokens, device))
 
         print("\n=== MLP Memory ===")
         print(inference_mlp(model, tokenizer,
@@ -448,7 +450,7 @@ def main():
                             args.prompt,
                             target_layer_index,
                             args.lambda_interp,
-                            50,
+                            args.max_new_tokens,
                             device))
 
 
