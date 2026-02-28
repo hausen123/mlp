@@ -101,43 +101,43 @@ def build_datastore(model, tokenizer, text_path,
 # kNN Target Build
 # =========================================================
 
-def compute_knn_targets(save_prefix, K, tau):
+def compute_knn_targets(save_prefix, K, tau, batch_size=512):
 
     keys = np.load(save_prefix + "_keys.npy")
     vals = np.load(save_prefix + "_vals.npy")
 
     dim = keys.shape[1]
-    index = faiss.IndexFlatL2(dim)
+    res = faiss.StandardGpuResources()
+    index_cpu = faiss.IndexFlatL2(dim)
+    index = faiss.index_cpu_to_gpu(res, 0, index_cpu)
     index.add(keys)
 
     all_targets = []
 
-    for i in tqdm(range(len(keys)), desc="Computing kNN targets"):
+    for start in tqdm(range(0, len(keys), batch_size), desc="Computing kNN targets"):
+        end = min(start + batch_size, len(keys))
+        batch_keys = keys[start:end]
+        D, I = index.search(batch_keys, K + 1)
 
-        query = keys[i:i+1]
-        D, I = index.search(query, K+1)
-
-        I = I[0]
-        D = D[0]
-
-        mask = I != i
-        I = I[mask][:K]
-        D = D[mask][:K]
-
-        weights = np.exp(-D / tau)
-
-        token_probs = {}
-
-        for idx, w in zip(I, weights):
-            token = int(vals[idx])
-            token_probs[token] = token_probs.get(token, 0) + float(w)
-
-        total = sum(token_probs.values())
-
-        for k in token_probs:
-            token_probs[k] /= total
-
-        all_targets.append(token_probs)
+        for bi in range(end - start):
+            gi = start + bi
+            ii = I[bi]
+            dd = D[bi]
+            mask = ii != gi
+            ii = ii[mask][:K]
+            dd = dd[mask][:K]
+            weights = np.exp(-dd / tau)
+            token_probs = {}
+            for idx, w in zip(ii, weights):
+                token = int(vals[idx])
+                token_probs[token] = token_probs.get(token, 0) + float(w)
+            total = sum(token_probs.values())
+            if total == 0:
+                all_targets.append({})
+                continue
+            for k in token_probs:
+                token_probs[k] /= total
+            all_targets.append(token_probs)
 
     np.save(save_prefix + "_targets.npy",
             np.array(all_targets, dtype=object),
@@ -192,9 +192,10 @@ class MLPMemory(nn.Module):
             nn.Linear(hidden_dim * 2, hidden_dim),
         )
 
-        self.embed_weight = embed_weight  # frozen
+        self.embed_weight = embed_weight.float()  # frozen, float32
 
     def forward(self, h):
+        h = h.float()
         h = self.mlp(h)
         logits = torch.matmul(h, self.embed_weight.T)
         return logits
@@ -234,7 +235,7 @@ def train_mlp(model, save_prefix,
 
         total_loss = 0
 
-        for keys, true_token, target_dicts in loader:
+        for keys, true_token, target_dicts in tqdm(loader, desc=f"Epoch {epoch+1}"):
 
             keys = keys.to(device)
             true_token = true_token.to(device)
@@ -244,15 +245,22 @@ def train_mlp(model, save_prefix,
 
             ce_loss = F.nll_loss(log_probs, true_token)
 
-            kl_loss = 0.0
+            kl_loss = torch.tensor(0.0, device=device)
 
             for i, target_dict in enumerate(target_dicts):
-                for token, p in target_dict.items():
-                    p = float(p)
-                    kl_loss += p * (
-                        np.log(p) -
-                        log_probs[i, token]
-                    )
+                if not target_dict:
+                    continue
+                tokens = torch.tensor(
+                    list(target_dict.keys()),
+                    dtype=torch.long, device=device
+                )
+                probs = torch.tensor(
+                    list(target_dict.values()),
+                    dtype=torch.float32, device=device
+                )
+                log_p_knn = torch.log(probs.clamp(min=1e-30))
+                log_p_mlp = log_probs[i, tokens]
+                kl_loss = kl_loss + (probs * (log_p_knn - log_p_mlp)).sum()
 
             kl_loss = kl_loss / len(target_dicts)
 

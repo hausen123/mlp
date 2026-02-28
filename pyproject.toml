@@ -5,7 +5,7 @@ requires-python = ">=3.11"
 dependencies = [
     "torch",
     "transformers",
-    "faiss-cpu",
+    "faiss-gpu-cu12",
     "tqdm",
     "numpy",
     "accelerate",
