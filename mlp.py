@@ -319,7 +319,11 @@ def inference_mlp(model, tokenizer, mlp,
                   prompt, target_layer_index,
                   lambda_interp,
                   max_new_tokens,
-                  device):
+                  device,
+                  repetition_penalty=1.1,
+                  temperature=0.7,
+                  top_p=0.8,
+                  top_k=20):
     model.eval()
     mlp.eval()
     inputs = tokenizer(prompt,
@@ -339,26 +343,27 @@ def inference_mlp(model, tokenizer, mlp,
         past_key_values = outputs.past_key_values
         lm_logits = outputs.logits[:, -1, :]
         p_lm = F.softmax(lm_logits, dim=-1)
-        hidden = outputs.hidden_states[
-            target_layer_index
-        ][:, -1, :]
+        hidden = outputs.hidden_states[target_layer_index][:, -1, :]
         mlp_logits = mlp(hidden)
         p_mlp = F.softmax(mlp_logits, dim=-1)
-        p_final = lambda_interp * p_mlp + \
-            (1 - lambda_interp) * p_lm
-        next_token = torch.argmax(
-            p_final,
-            dim=-1,
-            keepdim=True
-        )
-        generated = torch.cat(
-            [generated, next_token],
-            dim=-1
-        )
-    return tokenizer.decode(
-        generated[0],
-        skip_special_tokens=True
-    )
+        p_final = lambda_interp * p_mlp + (1 - lambda_interp) * p_lm
+        if repetition_penalty != 1.0:
+            for token_id in set(generated[0].tolist()):
+                p_final[0, token_id] /= repetition_penalty
+        logits = torch.log(p_final.clamp(min=1e-10)) / temperature
+        if top_k > 0:
+            top_k_vals = torch.topk(logits, top_k)[0]
+            logits = logits.masked_fill(logits < top_k_vals[:, -1:], float('-inf'))
+        if top_p < 1.0:
+            sorted_logits, sorted_idx = torch.sort(logits, descending=True)
+            cum_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+            remove = (cum_probs - F.softmax(sorted_logits, dim=-1)) >= top_p
+            sorted_logits[remove] = float('-inf')
+            logits = torch.zeros_like(logits).scatter(1, sorted_idx, sorted_logits)
+        probs = F.softmax(logits, dim=-1)
+        next_token = torch.multinomial(probs, num_samples=1)
+        generated = torch.cat([generated, next_token], dim=-1)
+    return tokenizer.decode(generated[0], skip_special_tokens=True)
 
 
 # =========================================================
