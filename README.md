@@ -56,7 +56,7 @@ uv run python test.py --step 5 --prompt "任意のプロンプト"  # MLP Memory
 
 | 引数 | デフォルト | 説明 |
 |------|-----------|------|
-| `--corpus` | (必須) | テキストコーパスのパス |
+| `--corpus` | `None` | テキストコーパスのパス（`build` / `full` モード時は必須） |
 | `--model_name` | `Qwen/Qwen2.5-0.5B` | HuggingFace モデル名 |
 | `--save_prefix` | `datastore` | データストアファイルの prefix |
 | `--max_length` | `256` | チャンク長（トークン数） |

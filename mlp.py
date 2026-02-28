@@ -17,7 +17,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-0.5B")
-    parser.add_argument("--corpus", type=str, required=True)
+    parser.add_argument("--corpus", type=str, default=None)
 
     parser.add_argument("--save_prefix", type=str, default="datastore")
 
@@ -380,6 +380,9 @@ def inference_mlp(model, tokenizer, mlp,
 def main():
 
     args = parse_args()
+
+    if args.mode in ["build", "full"] and args.corpus is None:
+        raise ValueError("--corpus is required for mode 'build' or 'full'")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
