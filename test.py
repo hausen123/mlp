@@ -3,6 +3,8 @@ import glob
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from mlp import (
+    DEFAULT_MODEL_NAME,
+    DEFAULT_MAX_NEW_TOKENS,
     build_datastore,
     compute_knn_targets,
     train_mlp,
@@ -11,25 +13,16 @@ from mlp import (
     MLPMemory,
 )
 
-MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
 CORPUS_PATH = "kangaekata.txt"
 SAVE_PREFIX = "test_ds"
 PROMPT = "原子力発電所の耐震設計において"
-MAX_NEW_TOKENS = 1024
-MAX_LENGTH = 1024
-K = 64
-TAU = 10.0
-ALPHA = 0.4
-LAMBDA_INTERP = 0.45
-BATCH_SIZE = 64
-EPOCHS = 3
 
 def load_model():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(DEFAULT_MODEL_NAME, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
+        DEFAULT_MODEL_NAME,
         dtype=torch.float16 if device == "cuda" else torch.float32,
         device_map="auto",
     )
@@ -38,39 +31,32 @@ def load_model():
 
 def step1(model, tokenizer, device, prompt):
     print("\n=== Step 1: Base inference ===")
-    out = inference(model, tokenizer, prompt, MAX_NEW_TOKENS, device)
-    print(out)
+    print(inference(model, tokenizer, prompt, device=device))
 
 def step2(model, tokenizer, device, target_layer_index):
     print("\n=== Step 2: Datastore build ===")
-    build_datastore(
-        model, tokenizer, CORPUS_PATH,
-        target_layer_index, device,
-        SAVE_PREFIX, MAX_LENGTH,
-    )
+    build_datastore(model, tokenizer, CORPUS_PATH, target_layer_index, device, SAVE_PREFIX)
 
 def step3():
     print("\n=== Step 3: kNN targets ===")
-    compute_knn_targets(SAVE_PREFIX, K, TAU)
+    compute_knn_targets(SAVE_PREFIX)
 
 def step4(model, device, target_layer_index):
     print("\n=== Step 4: Train MLP ===")
     return train_mlp(
-        model, SAVE_PREFIX, ALPHA, BATCH_SIZE, EPOCHS, device,
-        model_name=MODEL_NAME,
+        model, SAVE_PREFIX, device,
+        model_name=DEFAULT_MODEL_NAME,
         target_layer_index=target_layer_index,
-        lambda_interp=LAMBDA_INTERP,
-        K=K, tau=TAU, max_length=MAX_LENGTH,
     )
 
 def step5(model, tokenizer, mlp, device, target_layer_index, prompt):
     print("\n=== Step 5: Inference with MLP ===")
-    out = inference_mlp(
+    print(inference_mlp(
         model, tokenizer, mlp,
         prompt, target_layer_index,
-        mlp.config.lambda_interp, MAX_NEW_TOKENS, device,
-    )
-    print(out)
+        mlp.config.lambda_interp,
+        device=device,
+    ))
 
 def main():
     parser = argparse.ArgumentParser()

@@ -95,7 +95,8 @@ def load_text_corpus(path, tokenizer, max_length=DEFAULT_MAX_LENGTH):
 
 def build_datastore(model, tokenizer, text_path,
                     target_layer_index, device,
-                    save_prefix, max_length=DEFAULT_MAX_LENGTH):
+                    save_prefix, max_length=DEFAULT_MAX_LENGTH,
+                    min_ctx=1):
     model.eval()
     chunks = load_text_corpus(text_path, tokenizer, max_length)
     all_keys = []
@@ -108,8 +109,8 @@ def build_datastore(model, tokenizer, text_path,
                 output_hidden_states=True
             )
             hidden = outputs.hidden_states[target_layer_index]
-            keys = hidden.reshape(-1, hidden.size(-1)).cpu()
-            vals = chunk[:, 1:].reshape(-1).cpu()
+            keys = hidden[:, min_ctx:, :].reshape(-1, hidden.size(-1)).cpu()
+            vals = chunk[:, min_ctx + 1:].reshape(-1).cpu()
             all_keys.append(keys)
             all_vals.append(vals)
     keys = torch.cat(all_keys).numpy().astype("float32")
@@ -369,8 +370,9 @@ def inference(model, tokenizer, prompt,
             top_k=20,
             repetition_penalty=1.1,
         )
+    prompt_len = inputs["input_ids"].shape[1]
     return tokenizer.decode(
-        output[0],
+        output[0][prompt_len:],
         skip_special_tokens=True
     )
 
@@ -438,7 +440,8 @@ def inference_mlp(model, tokenizer, mlp,
         probs = F.softmax(logits, dim=-1)
         next_token = torch.multinomial(probs, num_samples=1)
         generated = torch.cat([generated, next_token], dim=-1)
-    return tokenizer.decode(generated[0], skip_special_tokens=True)
+    prompt_len = input_ids.shape[1]
+    return tokenizer.decode(generated[0][prompt_len:], skip_special_tokens=True)
 
 
 # =========================================================
