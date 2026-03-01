@@ -13,26 +13,42 @@ from safetensors.torch import save_file, load_file
 from transformers import AutoTokenizer, AutoModelForCausalLM, PretrainedConfig
 
 # =========================================================
+# Defaults
+# =========================================================
+
+DEFAULT_MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
+DEFAULT_MAX_LENGTH = 2048
+DEFAULT_BATCH_SIZE = 64
+DEFAULT_EPOCHS = 3
+DEFAULT_K = 64
+DEFAULT_TAU = 10.0
+DEFAULT_ALPHA = 0.4
+DEFAULT_LAMBDA_INTERP = 0.45
+DEFAULT_MAX_NEW_TOKENS = 1024
+DEFAULT_NUM_LAYERS = 8
+
+# =========================================================
 # Argument
 # =========================================================
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-0.5B-Instruct")
+    parser.add_argument("--model_name", type=str, default=DEFAULT_MODEL_NAME)
     parser.add_argument("--corpus", type=str, default=None)
     parser.add_argument("--save_prefix", type=str, default="datastore")
-    parser.add_argument("--max_length", type=int, default=1024)
-    parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--K", type=int, default=64)
-    parser.add_argument("--tau", type=float, default=10.0)
-    parser.add_argument("--alpha", type=float, default=0.4)
-    parser.add_argument("--lambda_interp", type=float, default=0.45)
+    parser.add_argument("--max_length", type=int, default=DEFAULT_MAX_LENGTH)
+    parser.add_argument("--batch_size", type=int, default=DEFAULT_BATCH_SIZE)
+    parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
+    parser.add_argument("--K", type=int, default=DEFAULT_K)
+    parser.add_argument("--tau", type=float, default=DEFAULT_TAU)
+    parser.add_argument("--alpha", type=float, default=DEFAULT_ALPHA)
+    parser.add_argument("--lambda_interp", type=float, default=DEFAULT_LAMBDA_INTERP)
+    parser.add_argument("--num_layers", type=int, default=DEFAULT_NUM_LAYERS)
     parser.add_argument("--mode", type=str, default="full",
                         choices=["build", "knn", "train", "infer", "full"])
     parser.add_argument("--prompt", type=str,
                         default="Transformerの仕組みを説明してください。")
-    parser.add_argument("--max_new_tokens", type=int, default=1024)
+    parser.add_argument("--max_new_tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
     parser.add_argument("--model_dir", type=str, default=None,
                         help="保存済み MLPMemory のディレクトリ（infer モード時に使用）")
     return parser.parse_args()
@@ -60,7 +76,7 @@ def split_text(input_str, max_length):
         result.append(current_chunk)
     return result
 
-def load_text_corpus(path, tokenizer, max_length):
+def load_text_corpus(path, tokenizer, max_length=DEFAULT_MAX_LENGTH):
     with open(path, "r", encoding="utf-8") as f:
         text = f.read()
     text_chunks = split_text(text, max_length)
@@ -79,7 +95,7 @@ def load_text_corpus(path, tokenizer, max_length):
 
 def build_datastore(model, tokenizer, text_path,
                     target_layer_index, device,
-                    save_prefix, max_length):
+                    save_prefix, max_length=DEFAULT_MAX_LENGTH):
     model.eval()
     chunks = load_text_corpus(text_path, tokenizer, max_length)
     all_keys = []
@@ -107,7 +123,7 @@ def build_datastore(model, tokenizer, text_path,
 # kNN Target Build
 # =========================================================
 
-def compute_knn_targets(save_prefix, K, tau, batch_size=512):
+def compute_knn_targets(save_prefix, K=DEFAULT_K, tau=DEFAULT_TAU, batch_size=512):
     keys = np.load(save_prefix + "_keys.npy")
     vals = np.load(save_prefix + "_vals.npy")
     dim = keys.shape[1]
@@ -153,16 +169,18 @@ class MLPMemoryConfig(PretrainedConfig):
     model_type = "mlp_memory"
     def __init__(
         self,
-        base_model_name="Qwen/Qwen2.5-0.5B-Instruct",
+        base_model_name=DEFAULT_MODEL_NAME,
         hidden_dim=896,
+        num_layers=DEFAULT_NUM_LAYERS,
         target_layer_index=16,
-        lambda_interp=0.45,
+        lambda_interp=DEFAULT_LAMBDA_INTERP,
         training=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self.base_model_name = base_model_name
         self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
         self.target_layer_index = target_layer_index
         self.lambda_interp = lambda_interp
         self.training = training or {}
@@ -203,20 +221,31 @@ def _make_save_dir(model_name):
     timestamp = datetime.now().strftime("%Y%m%d%H%M")
     return os.path.join("model", f"{timestamp}_{slug}")
 
+class MLPBlock(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.ff = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+        )
+    def forward(self, x):
+        return x + self.ff(self.norm(x))
+
 class MLPMemory(nn.Module):
     def __init__(self, config: MLPMemoryConfig, embed_weight):
         super().__init__()
         self.config = config
-        self.mlp = nn.Sequential(
-            nn.LayerNorm(config.hidden_dim),
-            nn.Linear(config.hidden_dim, config.hidden_dim * 2),
-            nn.GELU(),
-            nn.Linear(config.hidden_dim * 2, config.hidden_dim),
-        )
+        self.blocks = nn.ModuleList([
+            MLPBlock(config.hidden_dim)
+            for _ in range(config.num_layers)
+        ])
         self.register_buffer("embed_weight", embed_weight.float())
     def forward(self, h):
         h = h.float()
-        h = self.mlp(h)
+        for block in self.blocks:
+            h = block(h)
         logits = torch.matmul(h, self.embed_weight.T)
         return logits
     def save_pretrained(self, save_dir):
@@ -245,11 +274,17 @@ def collate_fn(batch):
     targets = [b[2] for b in batch]
     return keys, vals, targets
 
-def train_mlp(model, save_prefix,
-              alpha, batch_size,
-              epochs, device,
-              model_name=None, target_layer_index=None,
-              lambda_interp=0.45, K=64, tau=10.0, max_length=256):
+def train_mlp(model, save_prefix, device,
+              model_name=None,
+              target_layer_index=None,
+              alpha=DEFAULT_ALPHA,
+              batch_size=DEFAULT_BATCH_SIZE,
+              epochs=DEFAULT_EPOCHS,
+              lambda_interp=DEFAULT_LAMBDA_INTERP,
+              K=DEFAULT_K,
+              tau=DEFAULT_TAU,
+              max_length=DEFAULT_MAX_LENGTH,
+              num_layers=DEFAULT_NUM_LAYERS):
     dataset = MLPMemoryDataset(save_prefix)
     loader = DataLoader(dataset,
                         batch_size=batch_size,
@@ -261,6 +296,7 @@ def train_mlp(model, save_prefix,
     config = MLPMemoryConfig(
         base_model_name=model_name or "",
         hidden_dim=hidden_dim,
+        num_layers=num_layers,
         target_layer_index=target_layer_index or 0,
         lambda_interp=lambda_interp,
         training={
@@ -316,14 +352,22 @@ def train_mlp(model, save_prefix,
 # =========================================================
 
 def inference(model, tokenizer, prompt,
-              max_new_tokens, device):
+              max_new_tokens=DEFAULT_MAX_NEW_TOKENS, device="cpu"):
     model.eval()
-    inputs = tokenizer(prompt,
-                       return_tensors="pt").to(device)
+    messages = [{"role": "user", "content": prompt}]
+    text = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    inputs = tokenizer(text, return_tensors="pt").to(device)
     with torch.no_grad():
         output = model.generate(
             **inputs,
-            max_new_tokens=max_new_tokens
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=0.7,
+            top_p=0.8,
+            top_k=20,
+            repetition_penalty=1.1,
         )
     return tokenizer.decode(
         output[0],
@@ -337,17 +381,20 @@ def inference(model, tokenizer, prompt,
 
 def inference_mlp(model, tokenizer, mlp,
                   prompt, target_layer_index,
-                  lambda_interp,
-                  max_new_tokens,
-                  device,
+                  lambda_interp=DEFAULT_LAMBDA_INTERP,
+                  max_new_tokens=DEFAULT_MAX_NEW_TOKENS,
+                  device="cpu",
                   repetition_penalty=1.1,
                   temperature=0.7,
                   top_p=0.8,
                   top_k=20):
     model.eval()
     mlp.eval()
-    inputs = tokenizer(prompt,
-                       return_tensors="pt").to(device)
+    messages = [{"role": "user", "content": prompt}]
+    text = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    inputs = tokenizer(text, return_tensors="pt").to(device)
     input_ids = inputs["input_ids"]
     past_key_values = None
     generated = input_ids
@@ -362,14 +409,22 @@ def inference_mlp(model, tokenizer, mlp,
             )
         past_key_values = outputs.past_key_values
         lm_logits = outputs.logits[:, -1, :]
-        p_lm = F.softmax(lm_logits, dim=-1)
-        hidden = outputs.hidden_states[target_layer_index][:, -1, :]
-        mlp_logits = mlp(hidden)
-        p_mlp = F.softmax(mlp_logits, dim=-1)
-        p_final = lambda_interp * p_mlp + (1 - lambda_interp) * p_lm
+        mlp_logits = mlp(outputs.hidden_states[target_layer_index][:, -1, :])
         if repetition_penalty != 1.0:
             for token_id in set(generated[0].tolist()):
-                p_final[0, token_id] /= repetition_penalty
+                lm_logits[0, token_id] = (
+                    lm_logits[0, token_id] / repetition_penalty
+                    if lm_logits[0, token_id] > 0
+                    else lm_logits[0, token_id] * repetition_penalty
+                )
+                mlp_logits[0, token_id] = (
+                    mlp_logits[0, token_id] / repetition_penalty
+                    if mlp_logits[0, token_id] > 0
+                    else mlp_logits[0, token_id] * repetition_penalty
+                )
+        p_lm = F.softmax(lm_logits, dim=-1)
+        p_mlp = F.softmax(mlp_logits, dim=-1)
+        p_final = lambda_interp * p_mlp + (1 - lambda_interp) * p_lm
         logits = torch.log(p_final.clamp(min=1e-10)) / temperature
         if top_k > 0:
             top_k_vals = torch.topk(logits, top_k)[0]
@@ -411,36 +466,27 @@ def main():
     print("Target layer:", target_layer_index)
     if args.mode in ["build", "full"]:
         build_datastore(
-            model,
-            tokenizer,
-            args.corpus,
-            target_layer_index,
-            device,
-            args.save_prefix,
-            args.max_length
+            model, tokenizer, args.corpus,
+            target_layer_index, device,
+            args.save_prefix, args.max_length
         )
     if args.mode in ["knn", "full"]:
-        compute_knn_targets(
-            args.save_prefix,
-            args.K,
-            args.tau
-        )
+        compute_knn_targets(args.save_prefix, args.K, args.tau)
     mlp = None
     save_dir = args.model_dir
     if args.mode in ["train", "full"]:
         mlp, save_dir = train_mlp(
-            model,
-            args.save_prefix,
-            args.alpha,
-            args.batch_size,
-            args.epochs,
-            device,
+            model, args.save_prefix, device,
             model_name=args.model_name,
             target_layer_index=target_layer_index,
+            alpha=args.alpha,
+            batch_size=args.batch_size,
+            epochs=args.epochs,
             lambda_interp=args.lambda_interp,
             K=args.K,
             tau=args.tau,
             max_length=args.max_length,
+            num_layers=args.num_layers,
         )
     if args.mode in ["infer", "full"]:
         if mlp is None:
