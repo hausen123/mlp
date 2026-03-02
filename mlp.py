@@ -73,6 +73,8 @@ def parse_args():
     parser.add_argument("--prompt", type=str,
                         default="Transformerの仕組みを説明してください。")
     parser.add_argument("--max_new_tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
+    parser.add_argument("-m", "--comment", type=str, default=None,
+                        help="モデル保存時のコメント（train/qa-train/full/qa-full 時は必須）")
     return parser.parse_args()
 
 
@@ -258,6 +260,7 @@ class MLPMemoryConfig(PretrainedConfig):
         target_layer_index=16,
         lambda_interp=DEFAULT_LAMBDA_INTERP,
         training=None,
+        comment="",
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -267,6 +270,7 @@ class MLPMemoryConfig(PretrainedConfig):
         self.target_layer_index = target_layer_index
         self.lambda_interp = lambda_interp
         self.training = training or {}
+        self.comment = comment
 
 
 # =========================================================
@@ -367,7 +371,8 @@ def train_mlp(model, save_prefix, device,
               K=DEFAULT_K,
               tau=DEFAULT_TAU,
               max_length=DEFAULT_MAX_LENGTH,
-              num_layers=DEFAULT_NUM_LAYERS):
+              num_layers=DEFAULT_NUM_LAYERS,
+              comment=""):
     dataset = MLPMemoryDataset(save_prefix)
     loader = DataLoader(dataset,
                         batch_size=batch_size,
@@ -391,6 +396,7 @@ def train_mlp(model, save_prefix, device,
             "save_prefix": save_prefix,
             "max_length": max_length,
         },
+        comment=comment,
     )
     mlp = MLPMemory(config, embed_weight).to(device)
     optimizer = torch.optim.AdamW(mlp.parameters(), lr=4e-4)
@@ -439,7 +445,8 @@ def train_mlp_qa(model, save_prefix, device,
                  target_layer_index=None,
                  batch_size=DEFAULT_BATCH_SIZE,
                  epochs=DEFAULT_EPOCHS,
-                 num_layers=DEFAULT_NUM_LAYERS):
+                 num_layers=DEFAULT_NUM_LAYERS,
+                 comment=""):
     """Train MLP Memory on QA pairs with online LM inference and CE loss.
     For each batch:
       1. Pad QA token sequences and run the frozen LM (teacher forcing).
@@ -459,6 +466,7 @@ def train_mlp_qa(model, save_prefix, device,
         hidden_dim=hidden_dim,
         num_layers=num_layers,
         target_layer_index=target_layer_index or 0,
+        comment=comment,
     )
     mlp = MLPMemory(config, embed_weight).to(device)
     optimizer = torch.optim.AdamW(mlp.parameters(), lr=4e-4)
@@ -638,6 +646,8 @@ def main():
         raise ValueError("--corpus is required for mode 'build' or 'full'")
     if args.mode in ["qa-build", "qa-full"] and args.qa_path is None:
         raise ValueError("--qa_path is required for mode 'qa-build' or 'qa-full'")
+    if args.mode in ["train", "full", "qa-train", "qa-full"] and not args.comment:
+        raise ValueError("-m/--comment is required for training modes")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_name, trust_remote_code=True
@@ -680,6 +690,7 @@ def main():
             tau=args.tau,
             max_length=args.max_length,
             num_layers=args.num_layers,
+            comment=args.comment,
         )
     # --- QA workflow ---
     if args.mode in ["qa-build", "qa-full"]:
@@ -695,6 +706,7 @@ def main():
             batch_size=args.batch_size,
             epochs=args.epochs,
             num_layers=args.num_layers,
+            comment=args.comment,
         )
     # --- inference ---
     if args.mode in ["infer", "full", "qa-full"]:
