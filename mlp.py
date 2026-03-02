@@ -69,6 +69,8 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
     parser.add_argument("--lambda_interp", type=float, default=DEFAULT_LAMBDA_INTERP)
     parser.add_argument("--num_layers", type=int, default=DEFAULT_NUM_LAYERS)
+    parser.add_argument("--max_tokens_per_step", type=int, default=2048,
+                        help="MLP forward/backward のトークン上限（QA学習時のOOM防止）")
     # inference
     parser.add_argument("--prompt", type=str,
                         default="Transformerの仕組みを説明してください。")
@@ -446,6 +448,7 @@ def train_mlp_qa(model, save_prefix, device,
                  batch_size=DEFAULT_BATCH_SIZE,
                  epochs=DEFAULT_EPOCHS,
                  num_layers=DEFAULT_NUM_LAYERS,
+                 max_tokens_per_step=2048,
                  comment=""):
     """Train MLP Memory on QA pairs with online LM inference and CE loss.
     For each batch:
@@ -525,12 +528,19 @@ def train_mlp_qa(model, save_prefix, device,
                 continue
             keys_cat = torch.cat(all_keys, dim=0)
             vals_cat = torch.cat(all_vals, dim=0).to(device)
-            logits = mlp(keys_cat)
-            loss = F.cross_entropy(logits, vals_cat)
+            # Sub-batch MLP forward/backward to cap peak VRAM
+            # logits=[N, vocab] can OOM when N is large (long output seqs)
+            N = len(keys_cat)
             optimizer.zero_grad()
-            loss.backward()
+            accum_loss = 0.0
+            for t in range(0, N, max_tokens_per_step):
+                k = keys_cat[t:t + max_tokens_per_step]
+                v = vals_cat[t:t + max_tokens_per_step]
+                sub_loss = F.cross_entropy(mlp(k), v) * (len(k) / N)
+                sub_loss.backward()
+                accum_loss += sub_loss.item()
             optimizer.step()
-            total_loss += loss.item()
+            total_loss += accum_loss
             n_batches += 1
         print(f"Epoch {epoch+1}: {total_loss / max(n_batches, 1):.4f}")
     save_dir = _make_save_dir((model_name or "mlp-memory") + "-qa")
@@ -706,6 +716,7 @@ def main():
             batch_size=args.batch_size,
             epochs=args.epochs,
             num_layers=args.num_layers,
+            max_tokens_per_step=args.max_tokens_per_step,
             comment=args.comment,
         )
     # --- inference ---
