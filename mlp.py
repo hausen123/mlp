@@ -19,13 +19,13 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, PretrainedConfig
 DEFAULT_MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
 DEFAULT_MAX_LENGTH = 2048
 DEFAULT_BATCH_SIZE = 64
-DEFAULT_EPOCHS = 3
+DEFAULT_EPOCHS = 20
 DEFAULT_K = 64
 DEFAULT_TAU = 10.0
 DEFAULT_ALPHA = 0.4
 DEFAULT_LAMBDA_INTERP = 0.45
 DEFAULT_MAX_NEW_TOKENS = 1024
-DEFAULT_NUM_LAYERS = 8
+DEFAULT_NUM_LAYERS = 22
 
 # =========================================================
 # Argument
@@ -80,10 +80,12 @@ def load_text_corpus(path, tokenizer, max_length=DEFAULT_MAX_LENGTH):
     with open(path, "r", encoding="utf-8") as f:
         text = f.read()
     text_chunks = split_text(text, max_length)
+    eos = torch.tensor([tokenizer.eos_token_id])
     chunks = []
     for tc in text_chunks:
         ids = tokenizer(tc, return_tensors="pt",
                         truncation=False)["input_ids"][0]
+        ids = torch.cat([ids, eos])
         if len(ids) >= 2:
             chunks.append(ids)
     return chunks
@@ -440,6 +442,8 @@ def inference_mlp(model, tokenizer, mlp,
         probs = F.softmax(logits, dim=-1)
         next_token = torch.multinomial(probs, num_samples=1)
         generated = torch.cat([generated, next_token], dim=-1)
+        if next_token.item() == tokenizer.eos_token_id:
+            break
     prompt_len = input_ids.shape[1]
     return tokenizer.decode(generated[0][prompt_len:], skip_special_tokens=True)
 
