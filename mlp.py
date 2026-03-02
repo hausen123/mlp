@@ -34,25 +34,45 @@ DEFAULT_NUM_LAYERS = 22
 # =========================================================
 
 def parse_args():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="MLP Memory: kNN-LM / QA-based training and inference"
+    )
+    parser.add_argument("--mode", type=str, default="infer",
+                        choices=["build", "knn", "train", "infer", "full",
+                                 "qa-build", "qa-train", "qa-full"],
+                        help=(
+                            "build/knn/train/infer/full: kNN workflow. "
+                            "qa-build/qa-train/qa-full: QA workflow."
+                        ))
+    # model
     parser.add_argument("--model_name", type=str, default=DEFAULT_MODEL_NAME)
-    parser.add_argument("--corpus", type=str, default=None)
-    parser.add_argument("--save_prefix", type=str, default="datastore")
+    parser.add_argument("--model_dir", type=str, default=None,
+                        help="保存済み MLPMemory ディレクトリ (infer 時に必須)")
+    # kNN datastore
+    parser.add_argument("--corpus", type=str, default=None,
+                        help="コーパステキストファイル (build/full 時に必須)")
+    parser.add_argument("--save_prefix", type=str, default="datastore",
+                        help="kNN datastore の保存プレフィックス")
     parser.add_argument("--max_length", type=int, default=DEFAULT_MAX_LENGTH)
-    parser.add_argument("--batch_size", type=int, default=DEFAULT_BATCH_SIZE)
-    parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
     parser.add_argument("--K", type=int, default=DEFAULT_K)
     parser.add_argument("--tau", type=float, default=DEFAULT_TAU)
     parser.add_argument("--alpha", type=float, default=DEFAULT_ALPHA)
+    # QA datastore
+    parser.add_argument("--qa_path", type=str, default=None,
+                        help="QA JSONL ファイル (qa-build/qa-full 時に必須)")
+    parser.add_argument("--qa_prefix", type=str, default="qa_ds",
+                        help="QA datastore の保存プレフィックス")
+    parser.add_argument("--max_samples", type=int, default=None,
+                        help="QA サンプル数の上限 (省略時は全件)")
+    # training
+    parser.add_argument("--batch_size", type=int, default=DEFAULT_BATCH_SIZE)
+    parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
     parser.add_argument("--lambda_interp", type=float, default=DEFAULT_LAMBDA_INTERP)
     parser.add_argument("--num_layers", type=int, default=DEFAULT_NUM_LAYERS)
-    parser.add_argument("--mode", type=str, default="full",
-                        choices=["build", "knn", "train", "infer", "full"])
+    # inference
     parser.add_argument("--prompt", type=str,
                         default="Transformerの仕組みを説明してください。")
     parser.add_argument("--max_new_tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
-    parser.add_argument("--model_dir", type=str, default=None,
-                        help="保存済み MLPMemory のディレクトリ（infer モード時に使用）")
     return parser.parse_args()
 
 
@@ -616,21 +636,27 @@ def main():
     args = parse_args()
     if args.mode in ["build", "full"] and args.corpus is None:
         raise ValueError("--corpus is required for mode 'build' or 'full'")
+    if args.mode in ["qa-build", "qa-full"] and args.qa_path is None:
+        raise ValueError("--qa_path is required for mode 'qa-build' or 'qa-full'")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     tokenizer = AutoTokenizer.from_pretrained(
-        args.model_name,
-        trust_remote_code=True
+        args.model_name, trust_remote_code=True
     )
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_name,
-        dtype=torch.float16
-        if device == "cuda" else torch.float32,
-        device_map="auto"
-    )
-    model.eval()
-    num_layers = model.config.num_hidden_layers
-    target_layer_index = int(num_layers * 0.7)
-    print("Target layer:", target_layer_index)
+    # qa-build はモデル不要
+    need_model = args.mode != "qa-build"
+    model = None
+    target_layer_index = None
+    if need_model:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_name,
+            dtype=torch.float16 if device == "cuda" else torch.float32,
+            device_map="auto",
+        )
+        model.eval()
+        num_layers = model.config.num_hidden_layers
+        target_layer_index = int(num_layers * 0.7)
+        print(f"Target layer: {target_layer_index} / {num_layers}")
+    # --- kNN workflow ---
     if args.mode in ["build", "full"]:
         build_datastore(
             model, tokenizer, args.corpus,
@@ -655,11 +681,27 @@ def main():
             max_length=args.max_length,
             num_layers=args.num_layers,
         )
-    if args.mode in ["infer", "full"]:
+    # --- QA workflow ---
+    if args.mode in ["qa-build", "qa-full"]:
+        build_qa_datastore(
+            tokenizer, args.qa_path, args.qa_prefix,
+            max_samples=args.max_samples,
+        )
+    if args.mode in ["qa-train", "qa-full"]:
+        mlp, save_dir = train_mlp_qa(
+            model, args.qa_prefix, device,
+            model_name=args.model_name,
+            target_layer_index=target_layer_index,
+            batch_size=args.batch_size,
+            epochs=args.epochs,
+            num_layers=args.num_layers,
+        )
+    # --- inference ---
+    if args.mode in ["infer", "full", "qa-full"]:
         if mlp is None:
             if save_dir is None:
                 raise ValueError(
-                    "--model_dir is required for infer mode without training"
+                    "--model_dir is required for infer mode without prior training"
                 )
             embed_weight = model.get_input_embeddings().weight.detach()
             mlp = MLPMemory.from_pretrained(save_dir, embed_weight).to(device)
@@ -672,12 +714,9 @@ def main():
                         args.prompt, args.max_new_tokens, device))
         print("\n=== MLP Memory ===")
         print(inference_mlp(model, tokenizer,
-                            mlp,
-                            args.prompt,
-                            target_layer_index,
-                            lambda_interp,
-                            args.max_new_tokens,
-                            device))
+                            mlp, args.prompt,
+                            target_layer_index, lambda_interp,
+                            args.max_new_tokens, device))
 
 
 if __name__ == "__main__":
