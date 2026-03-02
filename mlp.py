@@ -1,5 +1,7 @@
 import os
 import re
+import json
+import random
 import argparse
 import numpy as np
 import torch
@@ -89,6 +91,64 @@ def load_text_corpus(path, tokenizer, max_length=DEFAULT_MAX_LENGTH):
         if len(ids) >= 2:
             chunks.append(ids)
     return chunks
+
+
+# =========================================================
+# QA Datastore Build (tokenization only, no LM pass)
+# =========================================================
+
+def build_qa_datastore(tokenizer, qa_path, save_prefix,
+                       max_seq_len=2048, max_samples=None):
+    """Tokenize QA pairs from JSONL and save as token sequences.
+    No LM pass required. Saves:
+      save_prefix_qa_plens.npy  - prompt lengths (int32)
+      save_prefix_qa_ids.npy   - full token id arrays (object array)
+    c_0 = chat-template prefix up to add_generation_prompt end.
+    w_0 = first token of output.
+    """
+    sequences = []
+    skipped = 0
+    with open(qa_path, encoding="utf-8") as f:
+        lines = f.readlines()
+    if max_samples is not None:
+        lines = lines[:max_samples]
+    for line in tqdm(lines, desc="Tokenizing QA pairs"):
+        line = line.strip()
+        if not line:
+            continue
+        item = json.loads(line)
+        instruction = item["instruction"]
+        output_text = item["output"]
+        messages = [{"role": "user", "content": instruction}]
+        prompt_text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        prompt_ids = tokenizer(
+            prompt_text, return_tensors="pt", add_special_tokens=False
+        )["input_ids"][0]
+        output_ids = tokenizer(
+            output_text, return_tensors="pt", add_special_tokens=False
+        )["input_ids"][0]
+        eos = torch.tensor([tokenizer.eos_token_id])
+        output_ids = torch.cat([output_ids, eos])
+        P = len(prompt_ids)
+        T = len(output_ids)
+        if P + T > max_seq_len:
+            skipped += 1
+            continue
+        full_ids = torch.cat([prompt_ids, output_ids]).numpy().astype("int32")
+        sequences.append((P, full_ids))
+    print(f"Tokenized {len(sequences)} QA pairs, skipped {skipped}")
+    np.save(
+        save_prefix + "_qa_plens.npy",
+        np.array([s[0] for s in sequences], dtype=np.int32)
+    )
+    np.save(
+        save_prefix + "_qa_ids.npy",
+        np.array([s[1] for s in sequences], dtype=object),
+        allow_pickle=True
+    )
+    print(f"Saved to {save_prefix}_qa_plens.npy / _qa_ids.npy")
 
 
 # =========================================================
@@ -346,6 +406,106 @@ def train_mlp(model, save_prefix, device,
             total_loss += loss.item()
         print(f"Epoch {epoch+1}: {total_loss/len(loader)}")
     save_dir = _make_save_dir(model_name or "mlp-memory")
+    mlp.save_pretrained(save_dir)
+    return mlp, save_dir
+
+
+# =========================================================
+# QA Training (CE loss only, no kNN / FAISS)
+# =========================================================
+
+def train_mlp_qa(model, save_prefix, device,
+                 model_name=None,
+                 target_layer_index=None,
+                 batch_size=DEFAULT_BATCH_SIZE,
+                 epochs=DEFAULT_EPOCHS,
+                 num_layers=DEFAULT_NUM_LAYERS):
+    """Train MLP Memory on QA pairs with online LM inference and CE loss.
+    For each batch:
+      1. Pad QA token sequences and run the frozen LM (teacher forcing).
+      2. Extract hidden_states[target_layer_index] at output positions.
+         key at position t = h_{P-1+t}, target = output_ids[t]
+      3. Compute CE(MLP(keys), targets) and update only the MLP.
+    No kNN / FAISS required.
+    """
+    prompt_lens = np.load(save_prefix + "_qa_plens.npy")
+    full_ids_arr = np.load(save_prefix + "_qa_ids.npy", allow_pickle=True)
+    sequences = list(zip(prompt_lens.tolist(), full_ids_arr))
+    hidden_dim = model.config.hidden_size
+    embed_weight = model.get_input_embeddings().weight.detach()
+    embed_weight.requires_grad = False
+    config = MLPMemoryConfig(
+        base_model_name=model_name or "",
+        hidden_dim=hidden_dim,
+        num_layers=num_layers,
+        target_layer_index=target_layer_index or 0,
+    )
+    mlp = MLPMemory(config, embed_weight).to(device)
+    optimizer = torch.optim.AdamW(mlp.parameters(), lr=4e-4)
+    indices = list(range(len(sequences)))
+    for epoch in range(epochs):
+        random.shuffle(indices)
+        total_loss = 0.0
+        n_batches = 0
+        model.eval()
+        mlp.train()
+        for batch_start in tqdm(
+            range(0, len(indices), batch_size),
+            desc=f"Epoch {epoch+1}"
+        ):
+            batch_idx = indices[batch_start:batch_start + batch_size]
+            batch_seqs = [sequences[i] for i in batch_idx]
+            # Sort longest-first to minimize padding waste
+            batch_seqs = sorted(batch_seqs, key=lambda x: len(x[1]), reverse=True)
+            max_len = len(batch_seqs[0][1])
+            input_ids_list = []
+            attn_mask_list = []
+            for P, full_ids in batch_seqs:
+                ids = torch.tensor(full_ids, dtype=torch.long)
+                pad_len = max_len - len(ids)
+                padded = F.pad(ids, (0, pad_len), value=0)
+                mask = torch.cat([
+                    torch.ones(len(ids), dtype=torch.long),
+                    torch.zeros(pad_len, dtype=torch.long),
+                ])
+                input_ids_list.append(padded)
+                attn_mask_list.append(mask)
+            input_ids_batch = torch.stack(input_ids_list).to(device)
+            attn_mask_batch = torch.stack(attn_mask_list).to(device)
+            with torch.no_grad():
+                outputs = model(
+                    input_ids=input_ids_batch,
+                    attention_mask=attn_mask_batch,
+                    output_hidden_states=True,
+                )
+            hidden = outputs.hidden_states[target_layer_index].float()  # [B, max_len, H]
+            del outputs
+            torch.cuda.empty_cache()
+            all_keys = []
+            all_vals = []
+            for i, (P, full_ids) in enumerate(batch_seqs):
+                T = len(full_ids) - P
+                if T < 1:
+                    continue
+                # h_{P-1} ... h_{P+T-2} → predict o_0 ... o_{T-1}
+                keys = hidden[i, P - 1:P + T - 1, :]
+                vals = torch.tensor(full_ids[P:P + T], dtype=torch.long)
+                all_keys.append(keys)
+                all_vals.append(vals)
+            del hidden
+            if not all_keys:
+                continue
+            keys_cat = torch.cat(all_keys, dim=0)
+            vals_cat = torch.cat(all_vals, dim=0).to(device)
+            logits = mlp(keys_cat)
+            loss = F.cross_entropy(logits, vals_cat)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+            n_batches += 1
+        print(f"Epoch {epoch+1}: {total_loss / max(n_batches, 1):.4f}")
+    save_dir = _make_save_dir((model_name or "mlp-memory") + "-qa")
     mlp.save_pretrained(save_dir)
     return mlp, save_dir
 
