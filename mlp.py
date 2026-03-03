@@ -72,6 +72,8 @@ def parse_args():
     parser.add_argument("--num_layers", type=int, default=DEFAULT_NUM_LAYERS)
     parser.add_argument("--max_tokens_per_step", type=int, default=2048,
                         help="MLP forward/backward のトークン上限（QA学習時のOOM防止）")
+    parser.add_argument("--checkpoint_every", type=int, default=3,
+                        help="N エポックごとにチェックポイント上書き保存（0で無効）")
     # inference
     parser.add_argument("--prompt", type=str,
                         default="Transformerの仕組みを説明してください。")
@@ -332,6 +334,12 @@ def _validate_resume(resume_dir, hidden_dim, num_layers, target_layer_index, use
             print(e)
         sys.exit(1)
 
+def _make_ckpt_dir(model_name):
+    name = model_name.split("/")[-1]
+    slug = re.sub(r'\.', '', name.lower())
+    slug = re.sub(r'[^a-z0-9]+', '-', slug).strip('-')
+    return os.path.join("model", f"ckpt_{slug}")
+
 def _make_save_dir(model_name):
     name = model_name.split("/")[-1]
     slug = re.sub(r'\.', '', name.lower())
@@ -404,6 +412,7 @@ def train_mlp(model, save_prefix, device,
               max_length=DEFAULT_MAX_LENGTH,
               num_layers=DEFAULT_NUM_LAYERS,
               resume_from=None,
+              checkpoint_every=3,
               comment=""):
     dataset = MLPMemoryDataset(save_prefix)
     loader = DataLoader(dataset,
@@ -438,6 +447,9 @@ def train_mlp(model, save_prefix, device,
     else:
         mlp = MLPMemory(config, embed_weight).to(device)
     optimizer = torch.optim.AdamW(mlp.parameters(), lr=4e-4)
+    ckpt_dir = _make_ckpt_dir(model_name or "mlp-memory") if checkpoint_every > 0 else None
+    if ckpt_dir:
+        print(f"Checkpoint dir: {ckpt_dir}")
     mlp.train()
     for epoch in range(epochs):
         total_loss = 0
@@ -469,6 +481,9 @@ def train_mlp(model, save_prefix, device,
             optimizer.step()
             total_loss += loss.item()
         print(f"Epoch {epoch+1}: {total_loss/len(loader)}")
+        if ckpt_dir and (epoch + 1) % checkpoint_every == 0:
+            mlp.save_pretrained(ckpt_dir)
+            print(f"Checkpoint saved to {ckpt_dir}")
     save_dir = _make_save_dir(model_name or "mlp-memory")
     mlp.save_pretrained(save_dir)
     return mlp, save_dir
@@ -487,6 +502,7 @@ def train_mlp_qa(model, save_prefix, device,
                  max_tokens_per_step=2048,
                  use_final_layer=False,
                  resume_from=None,
+                 checkpoint_every=3,
                  comment=""):
     """Train MLP Memory on QA pairs with online LM inference and CE loss.
     For each batch:
@@ -518,6 +534,9 @@ def train_mlp_qa(model, save_prefix, device,
     else:
         mlp = MLPMemory(config, embed_weight).to(device)
     optimizer = torch.optim.AdamW(mlp.parameters(), lr=4e-4)
+    ckpt_dir = _make_ckpt_dir((model_name or "mlp-memory") + "-qa") if checkpoint_every > 0 else None
+    if ckpt_dir:
+        print(f"Checkpoint dir: {ckpt_dir}")
     indices = list(range(len(sequences)))
     for epoch in range(epochs):
         random.shuffle(indices)
@@ -590,6 +609,9 @@ def train_mlp_qa(model, save_prefix, device,
             total_loss += accum_loss
             n_batches += 1
         print(f"Epoch {epoch+1}: {total_loss / max(n_batches, 1):.4f}")
+        if ckpt_dir and (epoch + 1) % checkpoint_every == 0:
+            mlp.save_pretrained(ckpt_dir)
+            print(f"Checkpoint saved to {ckpt_dir}")
     save_dir = _make_save_dir((model_name or "mlp-memory") + "-qa")
     mlp.save_pretrained(save_dir)
     return mlp, save_dir
@@ -753,6 +775,7 @@ def main():
             max_length=args.max_length,
             num_layers=args.num_layers,
             resume_from=args.resume_from,
+            checkpoint_every=args.checkpoint_every,
             comment=args.comment,
         )
     # --- QA workflow ---
@@ -772,6 +795,7 @@ def main():
             max_tokens_per_step=args.max_tokens_per_step,
             use_final_layer=args.use_final_layer,
             resume_from=args.resume_from,
+            checkpoint_every=args.checkpoint_every,
             comment=args.comment,
         )
     # --- inference ---
