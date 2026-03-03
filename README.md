@@ -29,6 +29,12 @@ uv sync
 uv run python mlp.py --mode infer \
   --model_dir model/YYYYMMDDHHMM_qwen25-05b-instruct-qa \
   --prompt "基準地震動の策定方法について教えてください。"
+
+# Base LM の出力をスキップして MLP Memory のみ出力
+uv run python mlp.py --mode infer \
+  --model_dir model/YYYYMMDDHHMM_qwen25-05b-instruct-qa \
+  --prompt "基準地震動の策定方法について教えてください。" \
+  --skip_base_lm
 ```
 
 ### QA 学習
@@ -85,6 +91,7 @@ uv run python mlp.py --mode full --corpus corpus.txt \
 | `--num_layers` | `22` | MLP の残差ブロック数 |
 | `--lambda_interp` | `0.45` | 推論時の MLP 補間係数 |
 | `--max_new_tokens` | `1024` | 推論時の最大生成トークン数 |
+| `--skip_base_lm` | `False` | 推論時に Base LM の出力をスキップ |
 | `--prompt` | `Transformerの仕組みを...` | 推論プロンプト |
 | `--K` | `64` | kNN の近傍数 |
 | `--tau` | `10.0` | kNN 距離スケール |
