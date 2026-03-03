@@ -1,5 +1,7 @@
 import os
 import re
+import json
+import random
 import argparse
 import numpy as np
 import torch
@@ -32,25 +34,53 @@ DEFAULT_NUM_LAYERS = 22
 # =========================================================
 
 def parse_args():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="MLP Memory: kNN-LM / QA-based training and inference"
+    )
+    parser.add_argument("--mode", type=str, default="infer",
+                        choices=["build", "knn", "train", "infer", "full",
+                                 "qa-build", "qa-train", "qa-full"],
+                        help=(
+                            "build/knn/train/infer/full: kNN workflow. "
+                            "qa-build/qa-train/qa-full: QA workflow."
+                        ))
+    # model
     parser.add_argument("--model_name", type=str, default=DEFAULT_MODEL_NAME)
-    parser.add_argument("--corpus", type=str, default=None)
-    parser.add_argument("--save_prefix", type=str, default="datastore")
+    parser.add_argument("--model_dir", type=str, default=None,
+                        help="保存済み MLPMemory ディレクトリ (infer 時に必須)")
+    # kNN datastore
+    parser.add_argument("--corpus", type=str, default=None,
+                        help="コーパステキストファイル (build/full 時に必須)")
+    parser.add_argument("--save_prefix", type=str, default="datastore",
+                        help="kNN datastore の保存プレフィックス")
     parser.add_argument("--max_length", type=int, default=DEFAULT_MAX_LENGTH)
-    parser.add_argument("--batch_size", type=int, default=DEFAULT_BATCH_SIZE)
-    parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
     parser.add_argument("--K", type=int, default=DEFAULT_K)
     parser.add_argument("--tau", type=float, default=DEFAULT_TAU)
     parser.add_argument("--alpha", type=float, default=DEFAULT_ALPHA)
+    # QA datastore
+    parser.add_argument("--qa_path", type=str, default=None,
+                        help="QA JSONL ファイル (qa-build/qa-full 時に必須)")
+    parser.add_argument("--qa_prefix", type=str, default="qa_ds",
+                        help="QA datastore の保存プレフィックス")
+    parser.add_argument("--max_samples", type=int, default=None,
+                        help="QA サンプル数の上限 (省略時は全件)")
+    # training
+    parser.add_argument("--batch_size", type=int, default=DEFAULT_BATCH_SIZE)
+    parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
     parser.add_argument("--lambda_interp", type=float, default=DEFAULT_LAMBDA_INTERP)
     parser.add_argument("--num_layers", type=int, default=DEFAULT_NUM_LAYERS)
-    parser.add_argument("--mode", type=str, default="full",
-                        choices=["build", "knn", "train", "infer", "full"])
+    parser.add_argument("--max_tokens_per_step", type=int, default=2048,
+                        help="MLP forward/backward のトークン上限（QA学習時のOOM防止）")
+    # inference
     parser.add_argument("--prompt", type=str,
                         default="Transformerの仕組みを説明してください。")
     parser.add_argument("--max_new_tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
-    parser.add_argument("--model_dir", type=str, default=None,
-                        help="保存済み MLPMemory のディレクトリ（infer モード時に使用）")
+    parser.add_argument("--skip_base_lm", action="store_true",
+                        help="推論時に Base LM の出力をスキップする")
+    parser.add_argument("--use_final_layer", action="store_true",
+                        help="70%層に加えて最終隠れ層も足し合わせて MLP に入力する")
+    parser.add_argument("-m", "--comment", type=str, default=None,
+                        help="モデル保存時のコメント（train/qa-train/full/qa-full 時は必須）")
     return parser.parse_args()
 
 
@@ -92,13 +122,71 @@ def load_text_corpus(path, tokenizer, max_length=DEFAULT_MAX_LENGTH):
 
 
 # =========================================================
+# QA Datastore Build (tokenization only, no LM pass)
+# =========================================================
+
+def build_qa_datastore(tokenizer, qa_path, save_prefix,
+                       max_seq_len=2048, max_samples=None):
+    """Tokenize QA pairs from JSONL and save as token sequences.
+    No LM pass required. Saves:
+      save_prefix_qa_plens.npy  - prompt lengths (int32)
+      save_prefix_qa_ids.npy   - full token id arrays (object array)
+    c_0 = chat-template prefix up to add_generation_prompt end.
+    w_0 = first token of output.
+    """
+    sequences = []
+    skipped = 0
+    with open(qa_path, encoding="utf-8") as f:
+        lines = f.readlines()
+    if max_samples is not None:
+        lines = lines[:max_samples]
+    for line in tqdm(lines, desc="Tokenizing QA pairs"):
+        line = line.strip()
+        if not line:
+            continue
+        item = json.loads(line)
+        instruction = item["instruction"]
+        output_text = item["output"]
+        messages = [{"role": "user", "content": instruction}]
+        prompt_text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        prompt_ids = tokenizer(
+            prompt_text, return_tensors="pt", add_special_tokens=False
+        )["input_ids"][0]
+        output_ids = tokenizer(
+            output_text, return_tensors="pt", add_special_tokens=False
+        )["input_ids"][0]
+        eos = torch.tensor([tokenizer.eos_token_id])
+        output_ids = torch.cat([output_ids, eos])
+        P = len(prompt_ids)
+        T = len(output_ids)
+        if P + T > max_seq_len:
+            skipped += 1
+            continue
+        full_ids = torch.cat([prompt_ids, output_ids]).numpy().astype("int32")
+        sequences.append((P, full_ids))
+    print(f"Tokenized {len(sequences)} QA pairs, skipped {skipped}")
+    np.save(
+        save_prefix + "_qa_plens.npy",
+        np.array([s[0] for s in sequences], dtype=np.int32)
+    )
+    np.save(
+        save_prefix + "_qa_ids.npy",
+        np.array([s[1] for s in sequences], dtype=object),
+        allow_pickle=True
+    )
+    print(f"Saved to {save_prefix}_qa_plens.npy / _qa_ids.npy")
+
+
+# =========================================================
 # Datastore Build
 # =========================================================
 
 def build_datastore(model, tokenizer, text_path,
                     target_layer_index, device,
                     save_prefix, max_length=DEFAULT_MAX_LENGTH,
-                    min_ctx=1):
+                    min_ctx=1, use_final_layer=False):
     model.eval()
     chunks = load_text_corpus(text_path, tokenizer, max_length)
     all_keys = []
@@ -111,6 +199,8 @@ def build_datastore(model, tokenizer, text_path,
                 output_hidden_states=True
             )
             hidden = outputs.hidden_states[target_layer_index]
+            if use_final_layer:
+                hidden = hidden + outputs.hidden_states[-1]
             keys = hidden[:, min_ctx:, :].reshape(-1, hidden.size(-1)).cpu()
             vals = chunk[:, min_ctx + 1:].reshape(-1).cpu()
             all_keys.append(keys)
@@ -177,7 +267,9 @@ class MLPMemoryConfig(PretrainedConfig):
         num_layers=DEFAULT_NUM_LAYERS,
         target_layer_index=16,
         lambda_interp=DEFAULT_LAMBDA_INTERP,
+        use_final_layer=False,
         training=None,
+        comment="",
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -186,7 +278,9 @@ class MLPMemoryConfig(PretrainedConfig):
         self.num_layers = num_layers
         self.target_layer_index = target_layer_index
         self.lambda_interp = lambda_interp
+        self.use_final_layer = use_final_layer
         self.training = training or {}
+        self.comment = comment
 
 
 # =========================================================
@@ -287,7 +381,8 @@ def train_mlp(model, save_prefix, device,
               K=DEFAULT_K,
               tau=DEFAULT_TAU,
               max_length=DEFAULT_MAX_LENGTH,
-              num_layers=DEFAULT_NUM_LAYERS):
+              num_layers=DEFAULT_NUM_LAYERS,
+              comment=""):
     dataset = MLPMemoryDataset(save_prefix)
     loader = DataLoader(dataset,
                         batch_size=batch_size,
@@ -311,6 +406,7 @@ def train_mlp(model, save_prefix, device,
             "save_prefix": save_prefix,
             "max_length": max_length,
         },
+        comment=comment,
     )
     mlp = MLPMemory(config, embed_weight).to(device)
     optimizer = torch.optim.AdamW(mlp.parameters(), lr=4e-4)
@@ -346,6 +442,120 @@ def train_mlp(model, save_prefix, device,
             total_loss += loss.item()
         print(f"Epoch {epoch+1}: {total_loss/len(loader)}")
     save_dir = _make_save_dir(model_name or "mlp-memory")
+    mlp.save_pretrained(save_dir)
+    return mlp, save_dir
+
+
+# =========================================================
+# QA Training (CE loss only, no kNN / FAISS)
+# =========================================================
+
+def train_mlp_qa(model, save_prefix, device,
+                 model_name=None,
+                 target_layer_index=None,
+                 batch_size=DEFAULT_BATCH_SIZE,
+                 epochs=DEFAULT_EPOCHS,
+                 num_layers=DEFAULT_NUM_LAYERS,
+                 max_tokens_per_step=2048,
+                 use_final_layer=False,
+                 comment=""):
+    """Train MLP Memory on QA pairs with online LM inference and CE loss.
+    For each batch:
+      1. Pad QA token sequences and run the frozen LM (teacher forcing).
+      2. Extract hidden_states[target_layer_index] at output positions.
+         key at position t = h_{P-1+t}, target = output_ids[t]
+      3. Compute CE(MLP(keys), targets) and update only the MLP.
+    No kNN / FAISS required.
+    """
+    prompt_lens = np.load(save_prefix + "_qa_plens.npy")
+    full_ids_arr = np.load(save_prefix + "_qa_ids.npy", allow_pickle=True)
+    sequences = list(zip(prompt_lens.tolist(), full_ids_arr))
+    hidden_dim = model.config.hidden_size
+    embed_weight = model.get_input_embeddings().weight.detach()
+    embed_weight.requires_grad = False
+    config = MLPMemoryConfig(
+        base_model_name=model_name or "",
+        hidden_dim=hidden_dim,
+        num_layers=num_layers,
+        target_layer_index=target_layer_index or 0,
+        use_final_layer=use_final_layer,
+        comment=comment,
+    )
+    mlp = MLPMemory(config, embed_weight).to(device)
+    optimizer = torch.optim.AdamW(mlp.parameters(), lr=4e-4)
+    indices = list(range(len(sequences)))
+    for epoch in range(epochs):
+        random.shuffle(indices)
+        total_loss = 0.0
+        n_batches = 0
+        model.eval()
+        mlp.train()
+        for batch_start in tqdm(
+            range(0, len(indices), batch_size),
+            desc=f"Epoch {epoch+1}"
+        ):
+            batch_idx = indices[batch_start:batch_start + batch_size]
+            batch_seqs = [sequences[i] for i in batch_idx]
+            # Sort longest-first to minimize padding waste
+            batch_seqs = sorted(batch_seqs, key=lambda x: len(x[1]), reverse=True)
+            max_len = len(batch_seqs[0][1])
+            input_ids_list = []
+            attn_mask_list = []
+            for P, full_ids in batch_seqs:
+                ids = torch.tensor(full_ids, dtype=torch.long)
+                pad_len = max_len - len(ids)
+                padded = F.pad(ids, (0, pad_len), value=0)
+                mask = torch.cat([
+                    torch.ones(len(ids), dtype=torch.long),
+                    torch.zeros(pad_len, dtype=torch.long),
+                ])
+                input_ids_list.append(padded)
+                attn_mask_list.append(mask)
+            input_ids_batch = torch.stack(input_ids_list).to(device)
+            attn_mask_batch = torch.stack(attn_mask_list).to(device)
+            with torch.no_grad():
+                outputs = model(
+                    input_ids=input_ids_batch,
+                    attention_mask=attn_mask_batch,
+                    output_hidden_states=True,
+                )
+            hidden = outputs.hidden_states[target_layer_index].float()  # [B, max_len, H]
+            if use_final_layer:
+                hidden = hidden + outputs.hidden_states[-1].float()
+            del outputs
+            torch.cuda.empty_cache()
+            all_keys = []
+            all_vals = []
+            for i, (P, full_ids) in enumerate(batch_seqs):
+                T = len(full_ids) - P
+                if T < 1:
+                    continue
+                # h_{P-1} ... h_{P+T-2} → predict o_0 ... o_{T-1}
+                keys = hidden[i, P - 1:P + T - 1, :]
+                vals = torch.tensor(full_ids[P:P + T], dtype=torch.long)
+                all_keys.append(keys)
+                all_vals.append(vals)
+            del hidden
+            if not all_keys:
+                continue
+            keys_cat = torch.cat(all_keys, dim=0)
+            vals_cat = torch.cat(all_vals, dim=0).to(device)
+            # Sub-batch MLP forward/backward to cap peak VRAM
+            # logits=[N, vocab] can OOM when N is large (long output seqs)
+            N = len(keys_cat)
+            optimizer.zero_grad()
+            accum_loss = 0.0
+            for t in range(0, N, max_tokens_per_step):
+                k = keys_cat[t:t + max_tokens_per_step]
+                v = vals_cat[t:t + max_tokens_per_step]
+                sub_loss = F.cross_entropy(mlp(k), v) * (len(k) / N)
+                sub_loss.backward()
+                accum_loss += sub_loss.item()
+            optimizer.step()
+            total_loss += accum_loss
+            n_batches += 1
+        print(f"Epoch {epoch+1}: {total_loss / max(n_batches, 1):.4f}")
+    save_dir = _make_save_dir((model_name or "mlp-memory") + "-qa")
     mlp.save_pretrained(save_dir)
     return mlp, save_dir
 
@@ -391,7 +601,8 @@ def inference_mlp(model, tokenizer, mlp,
                   repetition_penalty=1.1,
                   temperature=0.7,
                   top_p=0.8,
-                  top_k=20):
+                  top_k=20,
+                  use_final_layer=False):
     model.eval()
     mlp.eval()
     messages = [{"role": "user", "content": prompt}]
@@ -413,7 +624,10 @@ def inference_mlp(model, tokenizer, mlp,
             )
         past_key_values = outputs.past_key_values
         lm_logits = outputs.logits[:, -1, :]
-        mlp_logits = mlp(outputs.hidden_states[target_layer_index][:, -1, :])
+        h = outputs.hidden_states[target_layer_index][:, -1, :]
+        if use_final_layer:
+            h = h + outputs.hidden_states[-1][:, -1, :]
+        mlp_logits = mlp(h)
         if repetition_penalty != 1.0:
             for token_id in set(generated[0].tolist()):
                 lm_logits[0, token_id] = (
@@ -456,26 +670,35 @@ def main():
     args = parse_args()
     if args.mode in ["build", "full"] and args.corpus is None:
         raise ValueError("--corpus is required for mode 'build' or 'full'")
+    if args.mode in ["qa-build", "qa-full"] and args.qa_path is None:
+        raise ValueError("--qa_path is required for mode 'qa-build' or 'qa-full'")
+    if args.mode in ["train", "full", "qa-train", "qa-full"] and not args.comment:
+        raise ValueError("-m/--comment is required for training modes")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     tokenizer = AutoTokenizer.from_pretrained(
-        args.model_name,
-        trust_remote_code=True
+        args.model_name, trust_remote_code=True
     )
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_name,
-        dtype=torch.float16
-        if device == "cuda" else torch.float32,
-        device_map="auto"
-    )
-    model.eval()
-    num_layers = model.config.num_hidden_layers
-    target_layer_index = int(num_layers * 0.7)
-    print("Target layer:", target_layer_index)
+    # qa-build はモデル不要
+    need_model = args.mode != "qa-build"
+    model = None
+    target_layer_index = None
+    if need_model:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_name,
+            dtype=torch.float16 if device == "cuda" else torch.float32,
+            device_map="auto",
+        )
+        model.eval()
+        num_layers = model.config.num_hidden_layers
+        target_layer_index = int(num_layers * 0.7)
+        print(f"Target layer: {target_layer_index} / {num_layers}")
+    # --- kNN workflow ---
     if args.mode in ["build", "full"]:
         build_datastore(
             model, tokenizer, args.corpus,
             target_layer_index, device,
-            args.save_prefix, args.max_length
+            args.save_prefix, args.max_length,
+            use_final_layer=args.use_final_layer,
         )
     if args.mode in ["knn", "full"]:
         compute_knn_targets(args.save_prefix, args.K, args.tau)
@@ -494,12 +717,32 @@ def main():
             tau=args.tau,
             max_length=args.max_length,
             num_layers=args.num_layers,
+            comment=args.comment,
         )
-    if args.mode in ["infer", "full"]:
+    # --- QA workflow ---
+    if args.mode in ["qa-build", "qa-full"]:
+        build_qa_datastore(
+            tokenizer, args.qa_path, args.qa_prefix,
+            max_samples=args.max_samples,
+        )
+    if args.mode in ["qa-train", "qa-full"]:
+        mlp, save_dir = train_mlp_qa(
+            model, args.qa_prefix, device,
+            model_name=args.model_name,
+            target_layer_index=target_layer_index,
+            batch_size=args.batch_size,
+            epochs=args.epochs,
+            num_layers=args.num_layers,
+            max_tokens_per_step=args.max_tokens_per_step,
+            use_final_layer=args.use_final_layer,
+            comment=args.comment,
+        )
+    # --- inference ---
+    if args.mode in ["infer", "full", "qa-full"]:
         if mlp is None:
             if save_dir is None:
                 raise ValueError(
-                    "--model_dir is required for infer mode without training"
+                    "--model_dir is required for infer mode without prior training"
                 )
             embed_weight = model.get_input_embeddings().weight.detach()
             mlp = MLPMemory.from_pretrained(save_dir, embed_weight).to(device)
@@ -507,17 +750,17 @@ def main():
             lambda_interp = mlp.config.lambda_interp
         else:
             lambda_interp = args.lambda_interp
-        print("\n=== Base LM ===")
-        print(inference(model, tokenizer,
-                        args.prompt, args.max_new_tokens, device))
+        if not args.skip_base_lm:
+            print("\n=== Base LM ===")
+            print(inference(model, tokenizer,
+                            args.prompt, args.max_new_tokens, device))
+        use_final_layer = getattr(mlp.config, "use_final_layer", False)
         print("\n=== MLP Memory ===")
         print(inference_mlp(model, tokenizer,
-                            mlp,
-                            args.prompt,
-                            target_layer_index,
-                            lambda_interp,
-                            args.max_new_tokens,
-                            device))
+                            mlp, args.prompt,
+                            target_layer_index, lambda_interp,
+                            args.max_new_tokens, device,
+                            use_final_layer=use_final_layer))
 
 
 if __name__ == "__main__":
