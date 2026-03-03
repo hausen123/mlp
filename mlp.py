@@ -75,6 +75,8 @@ def parse_args():
     parser.add_argument("--prompt", type=str,
                         default="Transformerの仕組みを説明してください。")
     parser.add_argument("--max_new_tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
+    parser.add_argument("--skip_base_lm", action="store_true",
+                        help="推論時に Base LM の出力をスキップする")
     parser.add_argument("-m", "--comment", type=str, default=None,
                         help="モデル保存時のコメント（train/qa-train/full/qa-full 時は必須）")
     return parser.parse_args()
@@ -732,9 +734,10 @@ def main():
             lambda_interp = mlp.config.lambda_interp
         else:
             lambda_interp = args.lambda_interp
-        print("\n=== Base LM ===")
-        print(inference(model, tokenizer,
-                        args.prompt, args.max_new_tokens, device))
+        if not args.skip_base_lm:
+            print("\n=== Base LM ===")
+            print(inference(model, tokenizer,
+                            args.prompt, args.max_new_tokens, device))
         print("\n=== MLP Memory ===")
         print(inference_mlp(model, tokenizer,
                             mlp, args.prompt,
