@@ -77,6 +77,8 @@ def parse_args():
     parser.add_argument("--max_new_tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
     parser.add_argument("--skip_base_lm", action="store_true",
                         help="推論時に Base LM の出力をスキップする")
+    parser.add_argument("--use_final_layer", action="store_true",
+                        help="70%層に加えて最終隠れ層も足し合わせて MLP に入力する")
     parser.add_argument("-m", "--comment", type=str, default=None,
                         help="モデル保存時のコメント（train/qa-train/full/qa-full 時は必須）")
     return parser.parse_args()
@@ -184,7 +186,7 @@ def build_qa_datastore(tokenizer, qa_path, save_prefix,
 def build_datastore(model, tokenizer, text_path,
                     target_layer_index, device,
                     save_prefix, max_length=DEFAULT_MAX_LENGTH,
-                    min_ctx=1):
+                    min_ctx=1, use_final_layer=False):
     model.eval()
     chunks = load_text_corpus(text_path, tokenizer, max_length)
     all_keys = []
@@ -197,6 +199,8 @@ def build_datastore(model, tokenizer, text_path,
                 output_hidden_states=True
             )
             hidden = outputs.hidden_states[target_layer_index]
+            if use_final_layer:
+                hidden = hidden + outputs.hidden_states[-1]
             keys = hidden[:, min_ctx:, :].reshape(-1, hidden.size(-1)).cpu()
             vals = chunk[:, min_ctx + 1:].reshape(-1).cpu()
             all_keys.append(keys)
@@ -263,6 +267,7 @@ class MLPMemoryConfig(PretrainedConfig):
         num_layers=DEFAULT_NUM_LAYERS,
         target_layer_index=16,
         lambda_interp=DEFAULT_LAMBDA_INTERP,
+        use_final_layer=False,
         training=None,
         comment="",
         **kwargs,
@@ -273,6 +278,7 @@ class MLPMemoryConfig(PretrainedConfig):
         self.num_layers = num_layers
         self.target_layer_index = target_layer_index
         self.lambda_interp = lambda_interp
+        self.use_final_layer = use_final_layer
         self.training = training or {}
         self.comment = comment
 
@@ -451,6 +457,7 @@ def train_mlp_qa(model, save_prefix, device,
                  epochs=DEFAULT_EPOCHS,
                  num_layers=DEFAULT_NUM_LAYERS,
                  max_tokens_per_step=2048,
+                 use_final_layer=False,
                  comment=""):
     """Train MLP Memory on QA pairs with online LM inference and CE loss.
     For each batch:
@@ -471,6 +478,7 @@ def train_mlp_qa(model, save_prefix, device,
         hidden_dim=hidden_dim,
         num_layers=num_layers,
         target_layer_index=target_layer_index or 0,
+        use_final_layer=use_final_layer,
         comment=comment,
     )
     mlp = MLPMemory(config, embed_weight).to(device)
@@ -512,6 +520,8 @@ def train_mlp_qa(model, save_prefix, device,
                     output_hidden_states=True,
                 )
             hidden = outputs.hidden_states[target_layer_index].float()  # [B, max_len, H]
+            if use_final_layer:
+                hidden = hidden + outputs.hidden_states[-1].float()
             del outputs
             torch.cuda.empty_cache()
             all_keys = []
@@ -591,7 +601,8 @@ def inference_mlp(model, tokenizer, mlp,
                   repetition_penalty=1.1,
                   temperature=0.7,
                   top_p=0.8,
-                  top_k=20):
+                  top_k=20,
+                  use_final_layer=False):
     model.eval()
     mlp.eval()
     messages = [{"role": "user", "content": prompt}]
@@ -613,7 +624,10 @@ def inference_mlp(model, tokenizer, mlp,
             )
         past_key_values = outputs.past_key_values
         lm_logits = outputs.logits[:, -1, :]
-        mlp_logits = mlp(outputs.hidden_states[target_layer_index][:, -1, :])
+        h = outputs.hidden_states[target_layer_index][:, -1, :]
+        if use_final_layer:
+            h = h + outputs.hidden_states[-1][:, -1, :]
+        mlp_logits = mlp(h)
         if repetition_penalty != 1.0:
             for token_id in set(generated[0].tolist()):
                 lm_logits[0, token_id] = (
@@ -683,7 +697,8 @@ def main():
         build_datastore(
             model, tokenizer, args.corpus,
             target_layer_index, device,
-            args.save_prefix, args.max_length
+            args.save_prefix, args.max_length,
+            use_final_layer=args.use_final_layer,
         )
     if args.mode in ["knn", "full"]:
         compute_knn_targets(args.save_prefix, args.K, args.tau)
@@ -719,6 +734,7 @@ def main():
             epochs=args.epochs,
             num_layers=args.num_layers,
             max_tokens_per_step=args.max_tokens_per_step,
+            use_final_layer=args.use_final_layer,
             comment=args.comment,
         )
     # --- inference ---
@@ -738,11 +754,13 @@ def main():
             print("\n=== Base LM ===")
             print(inference(model, tokenizer,
                             args.prompt, args.max_new_tokens, device))
+        use_final_layer = getattr(mlp.config, "use_final_layer", False)
         print("\n=== MLP Memory ===")
         print(inference_mlp(model, tokenizer,
                             mlp, args.prompt,
                             target_layer_index, lambda_interp,
-                            args.max_new_tokens, device))
+                            args.max_new_tokens, device,
+                            use_final_layer=use_final_layer))
 
 
 if __name__ == "__main__":
