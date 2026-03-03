@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import json
 import random
 import argparse
@@ -79,6 +80,8 @@ def parse_args():
                         help="推論時に Base LM の出力をスキップする")
     parser.add_argument("--use_final_layer", action="store_true",
                         help="70%層に加えて最終隠れ層も足し合わせて MLP に入力する")
+    parser.add_argument("--resume_from", type=str, default=None,
+                        help="継続学習するモデルディレクトリ（アーキテクチャが一致しない場合はエラー）")
     parser.add_argument("-m", "--comment", type=str, default=None,
                         help="モデル保存時のコメント（train/qa-train/full/qa-full 時は必須）")
     return parser.parse_args()
@@ -311,6 +314,24 @@ class MLPMemoryDataset(Dataset):
 # MLP Memory
 # =========================================================
 
+def _validate_resume(resume_dir, hidden_dim, num_layers, target_layer_index, use_final_layer):
+    """保存済みモデルのアーキテクチャが現在の設定と一致するか検証する。"""
+    saved = MLPMemoryConfig.from_pretrained(resume_dir)
+    errors = []
+    if saved.hidden_dim != hidden_dim:
+        errors.append(f"  hidden_dim:         saved={saved.hidden_dim}, current={hidden_dim}")
+    if saved.num_layers != num_layers:
+        errors.append(f"  num_layers:         saved={saved.num_layers}, current={num_layers}")
+    if saved.target_layer_index != target_layer_index:
+        errors.append(f"  target_layer_index: saved={saved.target_layer_index}, current={target_layer_index}")
+    if getattr(saved, "use_final_layer", False) != use_final_layer:
+        errors.append(f"  use_final_layer:    saved={getattr(saved, 'use_final_layer', False)}, current={use_final_layer}")
+    if errors:
+        print("Error: incompatible model config in --resume_from:")
+        for e in errors:
+            print(e)
+        sys.exit(1)
+
 def _make_save_dir(model_name):
     name = model_name.split("/")[-1]
     slug = re.sub(r'\.', '', name.lower())
@@ -382,6 +403,7 @@ def train_mlp(model, save_prefix, device,
               tau=DEFAULT_TAU,
               max_length=DEFAULT_MAX_LENGTH,
               num_layers=DEFAULT_NUM_LAYERS,
+              resume_from=None,
               comment=""):
     dataset = MLPMemoryDataset(save_prefix)
     loader = DataLoader(dataset,
@@ -408,7 +430,13 @@ def train_mlp(model, save_prefix, device,
         },
         comment=comment,
     )
-    mlp = MLPMemory(config, embed_weight).to(device)
+    if resume_from:
+        _validate_resume(resume_from, hidden_dim, num_layers,
+                         target_layer_index or 0, False)
+        mlp = MLPMemory.from_pretrained(resume_from, embed_weight).to(device)
+        print(f"Resumed from {resume_from}")
+    else:
+        mlp = MLPMemory(config, embed_weight).to(device)
     optimizer = torch.optim.AdamW(mlp.parameters(), lr=4e-4)
     mlp.train()
     for epoch in range(epochs):
@@ -458,6 +486,7 @@ def train_mlp_qa(model, save_prefix, device,
                  num_layers=DEFAULT_NUM_LAYERS,
                  max_tokens_per_step=2048,
                  use_final_layer=False,
+                 resume_from=None,
                  comment=""):
     """Train MLP Memory on QA pairs with online LM inference and CE loss.
     For each batch:
@@ -481,7 +510,13 @@ def train_mlp_qa(model, save_prefix, device,
         use_final_layer=use_final_layer,
         comment=comment,
     )
-    mlp = MLPMemory(config, embed_weight).to(device)
+    if resume_from:
+        _validate_resume(resume_from, hidden_dim, num_layers,
+                         target_layer_index or 0, use_final_layer)
+        mlp = MLPMemory.from_pretrained(resume_from, embed_weight).to(device)
+        print(f"Resumed from {resume_from}")
+    else:
+        mlp = MLPMemory(config, embed_weight).to(device)
     optimizer = torch.optim.AdamW(mlp.parameters(), lr=4e-4)
     indices = list(range(len(sequences)))
     for epoch in range(epochs):
@@ -717,6 +752,7 @@ def main():
             tau=args.tau,
             max_length=args.max_length,
             num_layers=args.num_layers,
+            resume_from=args.resume_from,
             comment=args.comment,
         )
     # --- QA workflow ---
@@ -735,6 +771,7 @@ def main():
             num_layers=args.num_layers,
             max_tokens_per_step=args.max_tokens_per_step,
             use_final_layer=args.use_final_layer,
+            resume_from=args.resume_from,
             comment=args.comment,
         )
     # --- inference ---

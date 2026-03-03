@@ -57,6 +57,19 @@ uv run python mlp.py --mode qa-full \
   --prompt "基準地震動の策定方法について教えてください。"
 ```
 
+### 継続学習
+
+```bash
+# 保存済みモデルから続きを学習して新しい model/ に保存
+uv run python mlp.py --mode qa-train \
+  --qa_prefix qa_ds_full \
+  --resume_from model/YYYYMMDDHHMM_qwen25-05b-instruct-qa \
+  --epochs 10 \
+  -m "continued training: +10 epochs"
+```
+
+アーキテクチャ（`num_layers` / `use_final_layer` / `target_layer_index`）が一致しない場合はエラーを表示して終了します。
+
 ### kNN 学習
 
 ```bash
@@ -92,6 +105,8 @@ uv run python mlp.py --mode full --corpus corpus.txt \
 | `--lambda_interp` | `0.45` | 推論時の MLP 補間係数 |
 | `--max_new_tokens` | `1024` | 推論時の最大生成トークン数 |
 | `--skip_base_lm` | `False` | 推論時に Base LM の出力をスキップ |
+| `--resume_from` | `None` | 継続学習するモデルディレクトリ |
+| `--use_final_layer` | `False` | 70%層 + 最終隠れ層を MLP 入力に加算 |
 | `--prompt` | `Transformerの仕組みを...` | 推論プロンプト |
 | `--K` | `64` | kNN の近傍数 |
 | `--tau` | `10.0` | kNN 距離スケール |
@@ -109,6 +124,7 @@ logits = h @ embed_weight.T
 ```
 
 - target layer: `int(num_hidden_layers * 0.7)` = layer 16（24層モデル）
+- `--use_final_layer` 指定時: `h = h_layer16 + h_final`
 - embed_weight は凍結
 
 **QA 学習の入出力**
