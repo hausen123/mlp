@@ -42,10 +42,12 @@ def parse_args():
     parser.add_argument("--mode", type=str, default="infer",
                         choices=["build", "knn", "train", "infer", "full",
                                  "qa-build", "qa-train", "qa-full",
+                                 "qa-knn-build", "qa-knn-full",
                                  "rag-build", "rag-infer"],
                         help=(
-                            "build/knn/train/infer/full: kNN workflow. "
-                            "qa-build/qa-train/qa-full: QA workflow."
+                            "build/knn/train/infer/full: kNN workflow on text corpus. "
+                            "qa-build/qa-train/qa-full: QA CE-loss workflow. "
+                            "qa-knn-build/qa-knn-full: kNN workflow on QA JSONL."
                         ))
     # model
     parser.add_argument("--model_name", type=str, default=DEFAULT_MODEL_NAME)
@@ -219,6 +221,86 @@ def build_datastore(model, tokenizer, text_path,
     np.save(save_prefix + "_keys.npy", keys)
     np.save(save_prefix + "_vals.npy", vals)
     print("Datastore saved.")
+
+
+# =========================================================
+# QA kNN Datastore Build
+# =========================================================
+
+def build_qa_knn_datastore(model, tokenizer, qa_path, target_layer_index, device,
+                            save_prefix, batch_size=DEFAULT_BATCH_SIZE,
+                            use_final_layer=False, max_samples=None):
+    """QA JSONL の各ペアを teacher forcing で LM に通し、
+    output 位置の隠れ状態をキー、次トークンを値としてデータストアを構築する。
+    prompt は system なしで手動構築:
+      <|im_start|>user\\n{instruction}\\n\\n{input}<|im_end|>\\n<|im_start|>assistant\\n
+    保存: {save_prefix}_keys.npy, {save_prefix}_vals.npy
+    """
+    with open(qa_path, encoding="utf-8") as f:
+        lines = [l.strip() for l in f if l.strip()]
+    if max_samples is not None:
+        lines = lines[:max_samples]
+    sequences = []
+    for line in tqdm(lines, desc="Tokenizing QA pairs"):
+        item = json.loads(line)
+        instruction = item["instruction"]
+        input_text = item.get("input", "")
+        output_text = item["output"]
+        user_content = instruction
+        if input_text:
+            user_content += "\n\n" + input_text
+        prompt = "<|im_start|>user\n" + user_content + "<|im_end|>\n<|im_start|>assistant\n"
+        prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
+        output_ids = tokenizer(output_text, add_special_tokens=False)["input_ids"]
+        output_ids = output_ids + [tokenizer.eos_token_id]
+        if len(prompt_ids) + len(output_ids) > 2048:
+            continue
+        sequences.append((prompt_ids, output_ids))
+    print(f"Tokenized {len(sequences)} pairs (skipped {len(lines) - len(sequences)})")
+    all_keys = []
+    all_vals = []
+    model.eval()
+    for batch_start in tqdm(range(0, len(sequences), batch_size), desc="Building QA kNN datastore"):
+        batch = sequences[batch_start:batch_start + batch_size]
+        batch = sorted(batch, key=lambda x: len(x[0]) + len(x[1]), reverse=True)
+        max_len = max(len(p) + len(o) for p, o in batch)
+        input_ids_list = []
+        attn_mask_list = []
+        for p_ids, o_ids in batch:
+            full = p_ids + o_ids
+            pad_len = max_len - len(full)
+            padded = full + [0] * pad_len
+            mask = [1] * len(full) + [0] * pad_len
+            input_ids_list.append(padded)
+            attn_mask_list.append(mask)
+        input_ids_t = torch.tensor(input_ids_list, dtype=torch.long, device=device)
+        attn_mask_t = torch.tensor(attn_mask_list, dtype=torch.long, device=device)
+        with torch.no_grad():
+            outputs = model(
+                input_ids=input_ids_t,
+                attention_mask=attn_mask_t,
+                output_hidden_states=True,
+            )
+        hidden = outputs.hidden_states[target_layer_index].float()
+        if use_final_layer:
+            hidden = hidden + outputs.hidden_states[-1].float()
+        del outputs
+        torch.cuda.empty_cache()
+        for i, (p_ids, o_ids) in enumerate(batch):
+            P = len(p_ids)
+            T = len(o_ids)
+            if T < 1:
+                continue
+            keys = hidden[i, P - 1:P + T - 1, :].cpu()
+            vals = torch.tensor(o_ids, dtype=torch.long)
+            all_keys.append(keys)
+            all_vals.append(vals)
+        del hidden
+    keys_arr = torch.cat(all_keys).numpy().astype("float32")
+    vals_arr = torch.cat(all_vals).numpy().astype("int64")
+    np.save(save_prefix + "_keys.npy", keys_arr)
+    np.save(save_prefix + "_vals.npy", vals_arr)
+    print(f"QA kNN datastore saved: {len(keys_arr)} entries → {save_prefix}_keys/vals.npy")
 
 
 # =========================================================
@@ -805,7 +887,7 @@ def main():
         raise ValueError("--corpus is required for mode 'build' or 'full'")
     if args.mode in ["qa-build", "qa-full"] and args.qa_path is None:
         raise ValueError("--qa_path is required for mode 'qa-build' or 'qa-full'")
-    if args.mode in ["train", "full", "qa-train", "qa-full"] and not args.comment:
+    if args.mode in ["train", "full", "qa-train", "qa-full", "qa-knn-full"] and not args.comment:
         raise ValueError("-m/--comment is required for training modes")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     tokenizer = AutoTokenizer.from_pretrained(
@@ -813,6 +895,8 @@ def main():
     )
     # qa-build はモデル不要
     need_model = args.mode not in ("qa-build",)
+    if args.mode in ["qa-knn-build", "qa-full"] and args.qa_path is None:
+        raise ValueError("--qa_path is required for mode 'qa-knn-build' or 'qa-knn-full'")
     model = None
     target_layer_index = None
     if need_model:
@@ -870,6 +954,33 @@ def main():
             epochs=args.epochs,
             num_layers=args.num_layers,
             max_tokens_per_step=args.max_tokens_per_step,
+            use_final_layer=args.use_final_layer,
+            resume_from=args.resume_from,
+            checkpoint_every=args.checkpoint_every,
+            comment=args.comment,
+        )
+    # --- QA kNN workflow ---
+    if args.mode in ["qa-knn-build", "qa-knn-full"]:
+        build_qa_knn_datastore(
+            model, tokenizer, args.qa_path, target_layer_index, device,
+            args.save_prefix,
+            batch_size=args.batch_size,
+            use_final_layer=args.use_final_layer,
+            max_samples=args.max_samples,
+        )
+    if args.mode in ["qa-knn-full"]:
+        compute_knn_targets(args.save_prefix, args.K, args.tau)
+        mlp, save_dir = train_mlp(
+            model, args.save_prefix, device,
+            model_name=args.model_name,
+            target_layer_index=target_layer_index,
+            alpha=args.alpha,
+            batch_size=args.batch_size,
+            epochs=args.epochs,
+            lambda_interp=args.lambda_interp,
+            K=args.K,
+            tau=args.tau,
+            num_layers=args.num_layers,
             use_final_layer=args.use_final_layer,
             resume_from=args.resume_from,
             checkpoint_every=args.checkpoint_every,
