@@ -76,6 +76,8 @@ def parse_args():
     parser.add_argument("--num_layers", type=int, default=DEFAULT_NUM_LAYERS)
     parser.add_argument("--max_tokens_per_step", type=int, default=2048,
                         help="MLP forward/backward のトークン上限（QA学習時のOOM防止）")
+    parser.add_argument("--max_tokens_per_batch", type=int, default=16384,
+                        help="qa-knn-build の動的バッチサイズ上限（バッチ内総トークン数）")
     parser.add_argument("--checkpoint_every", type=int, default=3,
                         help="N エポックごとにチェックポイント上書き保存（0で無効）")
     # inference
@@ -227,13 +229,34 @@ def build_datastore(model, tokenizer, text_path,
 # QA kNN Datastore Build
 # =========================================================
 
+def _make_dynamic_batches(sequences, max_tokens_per_batch):
+    """長さ順にソートして max_tokens_per_batch を超えないようバッチ化する。
+    バッチ内最長 * バッチサイズ <= max_tokens_per_batch になるよう調整。
+    """
+    seqs = sorted(sequences, key=lambda x: len(x[0]) + len(x[1]), reverse=True)
+    batches = []
+    batch = []
+    for s in seqs:
+        seq_len = len(s[0]) + len(s[1])
+        new_max = seq_len if not batch else max(len(b[0]) + len(b[1]) for b in batch)
+        new_max = max(new_max, seq_len)
+        if batch and new_max * (len(batch) + 1) > max_tokens_per_batch:
+            batches.append(batch)
+            batch = [s]
+        else:
+            batch.append(s)
+    if batch:
+        batches.append(batch)
+    return batches
+
 def build_qa_knn_datastore(model, tokenizer, qa_path, target_layer_index, device,
-                            save_prefix, batch_size=DEFAULT_BATCH_SIZE,
+                            save_prefix, max_tokens_per_batch=16384,
                             use_final_layer=False, max_samples=None):
     """QA JSONL の各ペアを teacher forcing で LM に通し、
     output 位置の隠れ状態をキー、次トークンを値としてデータストアを構築する。
     prompt は system なしで手動構築:
       <|im_start|>user\\n{instruction}\\n\\n{input}<|im_end|>\\n<|im_start|>assistant\\n
+    max_tokens_per_batch: バッチ内の総トークン数上限（動的バッチ）。
     保存: {save_prefix}_keys.npy, {save_prefix}_vals.npy
     """
     with open(qa_path, encoding="utf-8") as f:
@@ -257,12 +280,24 @@ def build_qa_knn_datastore(model, tokenizer, qa_path, target_layer_index, device
             continue
         sequences.append((prompt_ids, output_ids))
     print(f"Tokenized {len(sequences)} pairs (skipped {len(lines) - len(sequences)})")
-    all_keys = []
-    all_vals = []
+    # 総outputトークン数を事前集計してmemmapを確保
+    total_output_tokens = sum(len(o) for _, o in sequences)
+    hidden_dim = model.config.hidden_size
+    print(f"Total output tokens: {total_output_tokens:,}  "
+          f"(keys={total_output_tokens * hidden_dim * 4 / 1e9:.1f}GB)")
+    keys_mm = np.lib.format.open_memmap(
+        save_prefix + "_keys.npy", mode="w+",
+        dtype="float32", shape=(total_output_tokens, hidden_dim)
+    )
+    vals_mm = np.lib.format.open_memmap(
+        save_prefix + "_vals.npy", mode="w+",
+        dtype="int64", shape=(total_output_tokens,)
+    )
+    batches = _make_dynamic_batches(sequences, max_tokens_per_batch)
+    print(f"Dynamic batches: {len(batches)} (max_tokens_per_batch={max_tokens_per_batch})")
     model.eval()
-    for batch_start in tqdm(range(0, len(sequences), batch_size), desc="Building QA kNN datastore"):
-        batch = sequences[batch_start:batch_start + batch_size]
-        batch = sorted(batch, key=lambda x: len(x[0]) + len(x[1]), reverse=True)
+    write_idx = 0
+    for batch in tqdm(batches, desc="Building QA kNN datastore"):
         max_len = max(len(p) + len(o) for p, o in batch)
         input_ids_list = []
         attn_mask_list = []
@@ -291,16 +326,13 @@ def build_qa_knn_datastore(model, tokenizer, qa_path, target_layer_index, device
             T = len(o_ids)
             if T < 1:
                 continue
-            keys = hidden[i, P - 1:P + T - 1, :].cpu()
-            vals = torch.tensor(o_ids, dtype=torch.long)
-            all_keys.append(keys)
-            all_vals.append(vals)
+            keys_mm[write_idx:write_idx + T] = hidden[i, P - 1:P + T - 1, :].cpu().numpy()
+            vals_mm[write_idx:write_idx + T] = np.array(o_ids, dtype="int64")
+            write_idx += T
         del hidden
-    keys_arr = torch.cat(all_keys).numpy().astype("float32")
-    vals_arr = torch.cat(all_vals).numpy().astype("int64")
-    np.save(save_prefix + "_keys.npy", keys_arr)
-    np.save(save_prefix + "_vals.npy", vals_arr)
-    print(f"QA kNN datastore saved: {len(keys_arr)} entries → {save_prefix}_keys/vals.npy")
+    keys_mm.flush()
+    vals_mm.flush()
+    print(f"QA kNN datastore saved: {write_idx:,} entries → {save_prefix}_keys/vals.npy")
 
 
 # =========================================================
@@ -964,7 +996,7 @@ def main():
         build_qa_knn_datastore(
             model, tokenizer, args.qa_path, target_layer_index, device,
             args.save_prefix,
-            batch_size=args.batch_size,
+            max_tokens_per_batch=args.max_tokens_per_batch,
             use_final_layer=args.use_final_layer,
             max_samples=args.max_samples,
         )
