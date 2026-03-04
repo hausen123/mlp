@@ -29,6 +29,7 @@ DEFAULT_ALPHA = 0.4
 DEFAULT_LAMBDA_INTERP = 0.45
 DEFAULT_MAX_NEW_TOKENS = 1024
 DEFAULT_NUM_LAYERS = 22
+DEFAULT_RAG_K = 3
 
 # =========================================================
 # Argument
@@ -40,7 +41,8 @@ def parse_args():
     )
     parser.add_argument("--mode", type=str, default="infer",
                         choices=["build", "knn", "train", "infer", "full",
-                                 "qa-build", "qa-train", "qa-full"],
+                                 "qa-build", "qa-train", "qa-full",
+                                 "rag-build", "rag-infer"],
                         help=(
                             "build/knn/train/infer/full: kNN workflow. "
                             "qa-build/qa-train/qa-full: QA workflow."
@@ -86,6 +88,8 @@ def parse_args():
                         help="継続学習するモデルディレクトリ（アーキテクチャが一致しない場合はエラー）")
     parser.add_argument("-m", "--comment", type=str, default=None,
                         help="モデル保存時のコメント（train/qa-train/full/qa-full 時は必須）")
+    parser.add_argument("--rag_k", type=int, default=DEFAULT_RAG_K,
+                        help="RAG 検索時の top-k 件数")
     return parser.parse_args()
 
 
@@ -411,6 +415,7 @@ def train_mlp(model, save_prefix, device,
               tau=DEFAULT_TAU,
               max_length=DEFAULT_MAX_LENGTH,
               num_layers=DEFAULT_NUM_LAYERS,
+              use_final_layer=False,
               resume_from=None,
               checkpoint_every=3,
               comment=""):
@@ -428,6 +433,7 @@ def train_mlp(model, save_prefix, device,
         num_layers=num_layers,
         target_layer_index=target_layer_index or 0,
         lambda_interp=lambda_interp,
+        use_final_layer=use_final_layer,
         training={
             "K": K,
             "tau": tau,
@@ -441,7 +447,7 @@ def train_mlp(model, save_prefix, device,
     )
     if resume_from:
         _validate_resume(resume_from, hidden_dim, num_layers,
-                         target_layer_index or 0, False)
+                         target_layer_index or 0, use_final_layer)
         mlp = MLPMemory.from_pretrained(resume_from, embed_weight).to(device)
         print(f"Resumed from {resume_from}")
     else:
@@ -618,6 +624,76 @@ def train_mlp_qa(model, save_prefix, device,
 
 
 # =========================================================
+# RAG
+# =========================================================
+
+def build_rag_index(model, tokenizer, qa_path, rag_prefix, device, batch_size=512):
+    """QA JSONL の instruction を token embedding mean-pool で埋め込み FAISS インデックスを構築する。
+    保存: {rag_prefix}_rag.index, {rag_prefix}_rag_meta.npy
+    """
+    records = []
+    with open(qa_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+    embed = model.get_input_embeddings().weight.detach().float()
+    dim = embed.shape[1]
+    vecs = np.zeros((len(records), dim), dtype=np.float32)
+    for i in tqdm(range(0, len(records), batch_size), desc="Building RAG index"):
+        batch = records[i:i + batch_size]
+        for j, r in enumerate(batch):
+            ids = tokenizer.encode(
+                r["instruction"], max_length=128, truncation=True, add_special_tokens=False
+            )
+            if not ids:
+                continue
+            ids_t = torch.tensor(ids, device=device)
+            vecs[i + j] = embed[ids_t].mean(0).cpu().numpy()
+    faiss.normalize_L2(vecs)
+    index = faiss.IndexFlatIP(dim)
+    index.add(vecs)
+    faiss.write_index(index, rag_prefix + "_rag.index")
+    np.save(rag_prefix + "_rag_meta.npy", np.array(records, dtype=object))
+    print(f"RAG index built: {len(records)} QA pairs → {rag_prefix}_rag.index")
+
+def inference_rag(model, tokenizer, query, rag_prefix,
+                  k=DEFAULT_RAG_K,
+                  max_new_tokens=DEFAULT_MAX_NEW_TOKENS,
+                  device="cpu"):
+    """RAG 推論: top-k QA ペアを検索してシステムプロンプトに付与し生成する。"""
+    index = faiss.read_index(rag_prefix + "_rag.index")
+    records = np.load(rag_prefix + "_rag_meta.npy", allow_pickle=True)
+    embed = model.get_input_embeddings().weight.detach().float()
+    ids = tokenizer.encode(query, max_length=128, truncation=True, add_special_tokens=False)
+    ids_t = torch.tensor(ids, device=device)
+    q_vec = embed[ids_t].mean(0).cpu().numpy().reshape(1, -1).astype(np.float32)
+    faiss.normalize_L2(q_vec)
+    _, I = index.search(q_vec, k)
+    retrieved = [records[i] for i in I[0]]
+    context = "\n\n".join(
+        f"Q: {r['instruction']}\nA: {r['output']}" for r in retrieved
+    )
+    messages = [
+        {"role": "system", "content": f"以下の参考情報を踏まえて回答してください。\n\n{context}"},
+        {"role": "user", "content": query},
+    ]
+    text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = tokenizer(text, return_tensors="pt").to(device)
+    with torch.no_grad():
+        output = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=0.7,
+            top_p=0.8,
+            top_k=20,
+            repetition_penalty=1.1,
+        )
+    prompt_len = inputs["input_ids"].shape[1]
+    return tokenizer.decode(output[0][prompt_len:], skip_special_tokens=True), retrieved
+
+# =========================================================
 # Inference (Base)
 # =========================================================
 
@@ -736,7 +812,7 @@ def main():
         args.model_name, trust_remote_code=True
     )
     # qa-build はモデル不要
-    need_model = args.mode != "qa-build"
+    need_model = args.mode not in ("qa-build",)
     model = None
     target_layer_index = None
     if need_model:
@@ -774,6 +850,7 @@ def main():
             tau=args.tau,
             max_length=args.max_length,
             num_layers=args.num_layers,
+            use_final_layer=args.use_final_layer,
             resume_from=args.resume_from,
             checkpoint_every=args.checkpoint_every,
             comment=args.comment,
@@ -798,6 +875,24 @@ def main():
             checkpoint_every=args.checkpoint_every,
             comment=args.comment,
         )
+    # --- RAG workflow ---
+    if args.mode == "rag-build":
+        if args.qa_path is None:
+            raise ValueError("--qa_path is required for mode 'rag-build'")
+        build_rag_index(model, tokenizer, args.qa_path, args.qa_prefix, device)
+    if args.mode == "rag-infer":
+        print("\n=== RAG ===")
+        result, retrieved = inference_rag(
+            model, tokenizer, args.prompt, args.qa_prefix,
+            k=args.rag_k,
+            max_new_tokens=args.max_new_tokens,
+            device=device,
+        )
+        print(result)
+        print("\n--- Retrieved QA pairs ---")
+        for i, r in enumerate(retrieved, 1):
+            print(f"[{i}] Q: {r['instruction']}")
+            print(f"    A: {r['output'][:120]}{'...' if len(r['output']) > 120 else ''}")
     # --- inference ---
     if args.mode in ["infer", "full", "qa-full"]:
         if mlp is None:

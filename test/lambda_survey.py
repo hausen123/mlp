@@ -18,7 +18,7 @@ from mlp import (
 )
 
 PROMPT = "基準地震動の策定方法について教えてください。"
-LAMBDA_VALUES = [0.40, 0.45, 0.50, 0.55, 0.60]
+LAMBDA_VALUES = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
 
 def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -38,7 +38,8 @@ def main():
     embed_weight = model.get_input_embeddings().weight.detach()
     mlp = MLPMemory.from_pretrained(save_dir, embed_weight).to(device)
     target_layer_index = mlp.config.target_layer_index
-    print(f"Target layer: {target_layer_index}")
+    use_final_layer = getattr(mlp.config, "use_final_layer", False)
+    print(f"Target layer: {target_layer_index}, use_final_layer: {use_final_layer}")
     out_path = Path(__file__).parent / f"lambda_survey_{datetime.now().strftime('%Y%m%d%H%M')}.txt"
     lines = []
     lines.append(f"Lambda survey — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
@@ -53,6 +54,7 @@ def main():
             lambda_interp=lam,
             max_new_tokens=DEFAULT_MAX_NEW_TOKENS,
             device=device,
+            use_final_layer=use_final_layer,
         )
         print(result)
         lines.append(f"\n[lambda={lam}]")
