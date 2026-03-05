@@ -24,7 +24,7 @@ DEFAULT_MAX_LENGTH = 2048
 DEFAULT_BATCH_SIZE = 64
 DEFAULT_EPOCHS = 20
 DEFAULT_K = 64
-DEFAULT_TAU = 10.0
+DEFAULT_TAU = 1.0
 DEFAULT_ALPHA = 0.4
 DEFAULT_LAMBDA_INTERP = 0.45
 DEFAULT_MAX_NEW_TOKENS = 1024
@@ -339,24 +339,43 @@ def build_qa_knn_datastore(model, tokenizer, qa_path, target_layer_index, device
 # kNN Target Build
 # =========================================================
 
-def compute_knn_targets(save_prefix, K=DEFAULT_K, tau=DEFAULT_TAU, batch_size=512):
-    keys = np.load(save_prefix + "_keys.npy")
-    vals = np.load(save_prefix + "_vals.npy")
+def compute_knn_targets(save_prefix, K=DEFAULT_K, tau=DEFAULT_TAU, batch_size=8192,
+                        ncentroids=4096, code_size=64, nprobe=32):
+    keys = np.load(save_prefix + "_keys.npy", mmap_mode="r")
+    vals = np.load(save_prefix + "_vals.npy", mmap_mode="r")
     dim = keys.shape[1]
+    n = len(keys)
+    K1 = K + 1
+    # GPU: GpuIndexIVFPQ で訓練・追加・検索すべてGPU (kNN-LM論文と同じ設定)
     res = faiss.StandardGpuResources()
-    index_cpu = faiss.IndexFlatL2(dim)
-    index = faiss.index_cpu_to_gpu(res, 0, index_cpu)
-    index.add(keys)
+    config = faiss.GpuIndexIVFPQConfig()
+    config.useFloat16LookupTables = True  # shared mem 65536→32768 bytes
+    index = faiss.GpuIndexIVFPQ(res, dim, ncentroids, code_size, 8,
+                                 faiss.METRIC_L2, config)
+    index.nprobe = nprobe
+    print(f"Training IVFPQ on GPU (ncentroids={ncentroids}, code_size={code_size}, n={n:,})...")
+    rng = np.random.default_rng(42)
+    sample_idx = rng.choice(n, size=min(500_000, n), replace=False)
+    index.train(np.array(keys[sample_idx], dtype=np.float32))
+    print(f"Adding {n:,} vectors...")
+    add_batch = 500_000
+    for start in tqdm(range(0, n, add_batch), desc="Adding"):
+        end = min(start + add_batch, n)
+        index.add_with_ids(
+            np.array(keys[start:end], dtype=np.float32),
+            np.arange(start, end, dtype=np.int64),
+        )
+    print(f"GPU free: {torch.cuda.mem_get_info()[0]/1e9:.1f}GB")
+    # 検索 + ターゲット計算 (バッチごとにインライン処理)
     all_targets = []
-    for start in tqdm(range(0, len(keys), batch_size), desc="Computing kNN targets"):
-        end = min(start + batch_size, len(keys))
-        batch_keys = keys[start:end]
-        D, I = index.search(batch_keys, K + 1)
-        for bi in range(end - start):
-            gi = start + bi
+    for qs in tqdm(range(0, n, batch_size), desc="Searching kNN"):
+        qe = min(qs + batch_size, n)
+        D, I = index.search(np.array(keys[qs:qe], dtype=np.float32), K1)
+        for bi in range(qe - qs):
+            gi = qs + bi
             ii = I[bi]
             dd = D[bi]
-            mask = ii != gi
+            mask = (ii != gi) & (ii >= 0)
             ii = ii[mask][:K]
             dd = dd[mask][:K]
             weights = np.exp(-dd / tau)
@@ -404,6 +423,9 @@ class MLPMemoryConfig(PretrainedConfig):
         self.use_final_layer = use_final_layer
         self.training = training or {}
         self.comment = comment
+    def to_json_string(self, use_diff=True):
+        d = self.to_dict()
+        return json.dumps(d, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
 
 
 # =========================================================
@@ -579,7 +601,7 @@ def train_mlp(model, save_prefix, device,
             logits = mlp(keys)
             log_probs = F.log_softmax(logits, dim=-1)
             ce_loss = F.nll_loss(log_probs, true_token)
-            kl_loss = torch.tensor(0.0, device=device)
+            kl_sum = torch.tensor(0.0, device=device)
             for i, target_dict in enumerate(target_dicts):
                 if not target_dict:
                     continue
@@ -591,10 +613,8 @@ def train_mlp(model, save_prefix, device,
                     list(target_dict.values()),
                     dtype=torch.float32, device=device
                 )
-                log_p_knn = torch.log(probs.clamp(min=1e-30))
-                log_p_mlp = log_probs[i, tokens]
-                kl_loss = kl_loss + (probs * (log_p_knn - log_p_mlp)).sum()
-            kl_loss = kl_loss / len(target_dicts)
+                kl_sum = kl_sum + (probs * (torch.log(probs.clamp(min=1e-30)) - log_probs[i, tokens])).sum()
+            kl_loss = kl_sum / len(target_dicts)
             loss = alpha * kl_loss + (1 - alpha) * ce_loss
             optimizer.zero_grad()
             loss.backward()
@@ -925,8 +945,8 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_name, trust_remote_code=True
     )
-    # qa-build はモデル不要
-    need_model = args.mode not in ("qa-build",)
+    # qa-build / knn はモデル不要
+    need_model = args.mode not in ("qa-build", "knn")
     if args.mode in ["qa-knn-build", "qa-full"] and args.qa_path is None:
         raise ValueError("--qa_path is required for mode 'qa-knn-build' or 'qa-knn-full'")
     model = None
@@ -995,15 +1015,15 @@ def main():
     if args.mode in ["qa-knn-build", "qa-knn-full"]:
         build_qa_knn_datastore(
             model, tokenizer, args.qa_path, target_layer_index, device,
-            args.save_prefix,
+            args.qa_prefix,
             max_tokens_per_batch=args.max_tokens_per_batch,
             use_final_layer=args.use_final_layer,
             max_samples=args.max_samples,
         )
     if args.mode in ["qa-knn-full"]:
-        compute_knn_targets(args.save_prefix, args.K, args.tau)
+        compute_knn_targets(args.qa_prefix, args.K, args.tau)
         mlp, save_dir = train_mlp(
-            model, args.save_prefix, device,
+            model, args.qa_prefix, device,
             model_name=args.model_name,
             target_layer_index=target_layer_index,
             alpha=args.alpha,
