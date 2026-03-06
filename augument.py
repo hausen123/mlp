@@ -355,21 +355,36 @@ async def process_text_file_with_rag_workflow(filepath: str, output_filename: st
     os.makedirs(os.path.dirname(output_filename), exist_ok=True)
     with open(output_filename, "w", encoding="utf-8") as f:
         f.write("")
+    import datetime
     total_entries = 0
+    qa_count = 0
+    start_time = time.time()
+    n_chunks = len(processing_chunks)
+    def _ts():
+        return datetime.datetime.now().strftime("%H:%M:%S")
+    def _eta(i):
+        elapsed = time.time() - start_time
+        if i == 0:
+            return "計算中"
+        per_chunk = elapsed / i
+        remaining = per_chunk * (n_chunks - i)
+        eta = datetime.datetime.now() + datetime.timedelta(seconds=remaining)
+        return f"{eta.strftime('%H:%M')} (残{int(remaining//60)}分)"
     for i, chunk_text in enumerate(processing_chunks):
         try:
             chunk_text = remove_until_parenthesis(chunk_text)
-            print(f"Processing chunk {i+1}/{len(processing_chunks)}...")
+            pct = (i + 1) / n_chunks * 100
+            print(f"[{_ts()}] chunk {i+1}/{n_chunks} ({pct:.0f}%) ETA:{_eta(i)} QA累計:{qa_count}")
             print("Chunk preview:", chunk_text[:100] + "..." if len(chunk_text) > 100 else chunk_text)
             # fact distillationを実行
             facts_response = fact_distillation(chunk_text, think=think, max_tokens=max_tokens)
             if not facts_response:
-                print(f"Failed to get facts for chunk {i+1}")
+                print(f"[{_ts()}] Failed to get facts for chunk {i+1}")
                 continue
             # factsをパース
             facts = parse_facts(facts_response)
             if not facts:
-                print(f"No facts extracted from chunk {i+1}")
+                print(f"[{_ts()}] No facts extracted from chunk {i+1}")
                 continue
             # 各factから質問を生成
             for fact in facts:
@@ -377,12 +392,12 @@ async def process_text_file_with_rag_workflow(filepath: str, output_filename: st
                 # Step 1: 質問のみ生成
                 questions_output = generate_questions_only(fact, think=think, max_tokens=max_tokens)
                 if not questions_output:
-                    print(f"Failed to generate questions for fact")
+                    print(f"[{_ts()}] Failed to generate questions for fact")
                     continue
                 # Step 2: 質問をパース
                 questions = parse_questions(questions_output)
                 if not questions:
-                    print(f"No questions extracted from fact")
+                    print(f"[{_ts()}] No questions extracted from fact")
                     continue
                 print(f"Generated {len(questions)} questions")
                 # Step 3: 各質問に対してRAGで回答生成
@@ -393,14 +408,17 @@ async def process_text_file_with_rag_workflow(filepath: str, output_filename: st
                         qa_json = create_qa_pair_json(question, answer, fact)
                         with open(output_filename, "a", encoding="utf-8") as f:
                             f.write(qa_json + "\n")
+                        qa_count += 1
                         print(f"Saved Q&A pair: Q={question[:30]}...")
             total_entries += 1
-            print(f"Completed processing chunk {i+1}")
+            elapsed = time.time() - start_time
+            print(f"[{_ts()}] chunk {i+1}/{n_chunks} 完了 ({(i+1)/n_chunks*100:.0f}%) elapsed:{elapsed/60:.1f}分 ETA:{_eta(i+1)} QA累計:{qa_count}")
         except Exception as e:
-            print(f"Error processing chunk {i+1}: {e}")
+            print(f"[{_ts()}] Error processing chunk {i+1}: {e}")
             continue
+    elapsed_total = time.time() - start_time
     vector_db.close()
-    print(f"RAG workflow complete. Saved entries to {output_filename}")
+    print(f"[{_ts()}] RAG workflow complete. {qa_count} QA pairs, elapsed:{elapsed_total/60:.1f}分, output:{output_filename}")
 
 def generate_dataset_distil_facts(filepath: str, output_file: str = None, max_chunks: int = None, think: bool = False, max_tokens: int = None) -> int:
     """テキストファイルからfact distillation形式のデータセットを生成する"""

@@ -1,4 +1,8 @@
 tmp/
+.env
+*.db
+*.faiss
+*.jsonl
 input.txt
 .venv/
 __pycache__/
