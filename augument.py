@@ -318,7 +318,7 @@ def process_text_file_to_alpaca(filepath: str, output_filename: str = None, max_
     
     print(f"Dataset generation complete. Saved {total_entries} entries to {output_filename}")
 
-async def process_text_file_with_rag_workflow(filepath: str, output_filename: str = None, max_chunks: int = None, think: bool = False, max_tokens: int = None) -> None:
+async def process_text_file_with_rag_workflow(filepath: str, output_filename: str = None, max_chunks: int = None, random_sample: bool = False, think: bool = False, max_tokens: int = None) -> None:
     """テキストファイルを読み込み、Q→RAG→Aのワークフローでアルパカデータセットを生成"""
     from src.core.vector_db import VectorDB
     if not output_filename:
@@ -335,12 +335,15 @@ async def process_text_file_with_rag_workflow(filepath: str, output_filename: st
     db_chunks_limit = 1000 if len(all_chunks) > 1000 else len(all_chunks)
     db_chunks = all_chunks[:db_chunks_limit]
     print(f"Using first {db_chunks_limit} chunks for VectorDB")
-    # 処理対象チャンク（ランダム選択またはmax_chunks制限）
-    import random
+    # 処理対象チャンク（先頭からmax_chunks、またはランダム選択）
     if max_chunks and max_chunks < len(all_chunks):
-        # ランダムに選択
-        processing_chunks = random.sample(all_chunks, max_chunks)
-        print(f"Randomly selected {max_chunks} chunks for processing")
+        if random_sample:
+            import random
+            processing_chunks = random.sample(all_chunks, max_chunks)
+            print(f"Randomly selected {max_chunks} chunks for processing")
+        else:
+            processing_chunks = all_chunks[:max_chunks]
+            print(f"Processing first {max_chunks} chunks")
     else:
         processing_chunks = all_chunks
         print(f"Processing all {len(processing_chunks)} chunks")
@@ -582,8 +585,10 @@ if __name__ == '__main__':
     parser.add_argument('--output', '-o', help='Output JSONL file path (optional)')
     parser.add_argument('--max-chunks', '-c', type=int, help='Maximum number of chunks to process')
     parser.add_argument('--max-tokens', '-t', type=int, default=2048, help='Maximum tokens per response')
-    parser.add_argument('--mode', choices=['facts', 'active'], default='active', 
+    parser.add_argument('--mode', choices=['facts', 'active'], default='active',
                        help='Dataset type: facts for fact distillation, active for active reading (default: active)')
+    parser.add_argument('--random', action='store_true',
+                       help='Randomly sample max_chunks instead of taking from the beginning (default: sequential)')
     
     args = parser.parse_args()
     
@@ -594,6 +599,7 @@ if __name__ == '__main__':
             filepath=args.filepath,
             output_filename=args.output,
             max_chunks=args.max_chunks,
+            random_sample=args.random,
             think=False,
             max_tokens=args.max_tokens
         ))

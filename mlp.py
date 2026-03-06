@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import time
 import json
 import random
 import argparse
@@ -792,8 +793,22 @@ def train_mlp_qa(model, save_prefix, device,
 # RAG
 # =========================================================
 
+E5_EMBEDDING_DIM = 384
+
+def _get_e5_embedding(text: str) -> np.ndarray:
+    """kawarasaki02 E5 API でテキストを埋め込む（同期）。"""
+    import httpx
+    from dotenv import load_dotenv
+    load_dotenv()
+    api_base = os.getenv("API_BASE_URL", "http://kawarasaki02.info")
+    url = f"{api_base}/embedding/e5"
+    with httpx.Client(follow_redirects=True, timeout=30.0) as client:
+        response = client.post(url, json={"query": text})
+        response.raise_for_status()
+        return np.array(response.json(), dtype=np.float32)
+
 def build_rag_index(model, tokenizer, qa_path, rag_prefix, device, batch_size=512):
-    """QA JSONL の instruction を token embedding mean-pool で埋め込み FAISS インデックスを構築する。
+    """QA JSONL を E5 embedding で埋め込み FAISS インデックスを構築する。
     保存: {rag_prefix}_rag.index, {rag_prefix}_rag_meta.npy
     """
     os.makedirs(os.path.dirname(rag_prefix) or ".", exist_ok=True)
@@ -803,19 +818,14 @@ def build_rag_index(model, tokenizer, qa_path, rag_prefix, device, batch_size=51
             line = line.strip()
             if line:
                 records.append(json.loads(line))
-    embed = model.get_input_embeddings().weight.detach().float()
-    dim = embed.shape[1]
+    dim = E5_EMBEDDING_DIM
     vecs = np.zeros((len(records), dim), dtype=np.float32)
-    for i in tqdm(range(0, len(records), batch_size), desc="Building RAG index"):
-        batch = records[i:i + batch_size]
-        for j, r in enumerate(batch):
-            ids = tokenizer.encode(
-                r["instruction"], max_length=128, truncation=True, add_special_tokens=False
-            )
-            if not ids:
-                continue
-            ids_t = torch.tensor(ids, device=device)
-            vecs[i + j] = embed[ids_t].mean(0).cpu().numpy()
+    for i, r in enumerate(tqdm(records, desc="Building RAG index")):
+        text = " ".join(filter(None, [r.get("instruction", ""), r.get("input", ""), r.get("output", "")]))
+        try:
+            vecs[i] = _get_e5_embedding(text)
+        except Exception as e:
+            print(f"Embedding failed for record {i}: {e}")
     faiss.normalize_L2(vecs)
     index = faiss.IndexFlatIP(dim)
     index.add(vecs)
@@ -827,13 +837,10 @@ def inference_rag(model, tokenizer, query, rag_prefix,
                   k=DEFAULT_RAG_K,
                   max_new_tokens=DEFAULT_MAX_NEW_TOKENS,
                   device="cpu"):
-    """RAG 推論: top-k QA ペアを検索してシステムプロンプトに付与し生成する。"""
+    """RAG 推論: E5 embedding で top-k QA ペアを検索してシステムプロンプトに付与し生成する。"""
     index = faiss.read_index(rag_prefix + "_rag.index")
     records = np.load(rag_prefix + "_rag_meta.npy", allow_pickle=True)
-    embed = model.get_input_embeddings().weight.detach().float()
-    ids = tokenizer.encode(query, max_length=128, truncation=True, add_special_tokens=False)
-    ids_t = torch.tensor(ids, device=device)
-    q_vec = embed[ids_t].mean(0).cpu().numpy().reshape(1, -1).astype(np.float32)
+    q_vec = _get_e5_embedding(query).reshape(1, -1)
     faiss.normalize_L2(q_vec)
     _, I = index.search(q_vec, k)
     retrieved = [records[i] for i in I[0]]

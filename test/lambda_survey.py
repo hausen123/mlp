@@ -65,9 +65,18 @@ def main():
                 device=device,
             )
             rag_result = rag_out[0] if isinstance(rag_out, tuple) else rag_out
+            retrieved = rag_out[1] if isinstance(rag_out, tuple) else []
             print(rag_result)
+            print("\n--- Retrieved QA pairs ---")
+            for i, r in enumerate(retrieved, 1):
+                print(f"[{i}] Q: {r['instruction']}")
+                print(f"    A: {r['output'][:120]}{'...' if len(r['output']) > 120 else ''}")
             lines.append("\n[RAG baseline]")
             lines.append(rag_result)
+            lines.append("\n[Retrieved QA pairs]")
+            for i, r in enumerate(retrieved, 1):
+                lines.append(f"[{i}] Q: {r['instruction']}")
+                lines.append(f"    A: {r['output'][:200]}{'...' if len(r['output']) > 200 else ''}")
             lines.append("-" * 60)
         except Exception as e:
             print(f"RAG inference failed: {e}")
