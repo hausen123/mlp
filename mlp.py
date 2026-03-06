@@ -346,6 +346,7 @@ def compute_knn_targets(save_prefix, K=DEFAULT_K, tau=DEFAULT_TAU, batch_size=81
     dim = keys.shape[1]
     n = len(keys)
     K1 = K + 1
+    ncentroids = min(ncentroids, max(1, n // 39))
     # GPU: GpuIndexIVFPQ で訓練・追加・検索すべてGPU (kNN-LM論文と同じ設定)
     res = faiss.StandardGpuResources()
     config = faiss.GpuIndexIVFPQConfig()
