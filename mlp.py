@@ -56,7 +56,7 @@ def parse_args():
     # kNN datastore
     parser.add_argument("--corpus", type=str, default=None,
                         help="コーパステキストファイル (build/full 時に必須)")
-    parser.add_argument("--save_prefix", type=str, default="datastore",
+    parser.add_argument("--save_prefix", type=str, default="tmp/datastore",
                         help="kNN datastore の保存プレフィックス")
     parser.add_argument("--max_length", type=int, default=DEFAULT_MAX_LENGTH)
     parser.add_argument("--K", type=int, default=DEFAULT_K)
@@ -65,7 +65,7 @@ def parse_args():
     # QA datastore
     parser.add_argument("--qa_path", type=str, default=None,
                         help="QA JSONL ファイル (qa-build/qa-full 時に必須)")
-    parser.add_argument("--qa_prefix", type=str, default="qa_ds",
+    parser.add_argument("--qa_prefix", type=str, default="tmp/qa_ds",
                         help="QA datastore の保存プレフィックス")
     parser.add_argument("--max_samples", type=int, default=None,
                         help="QA サンプル数の上限 (省略時は全件)")
@@ -147,6 +147,7 @@ def build_qa_datastore(tokenizer, qa_path, save_prefix,
     c_0 = chat-template prefix up to add_generation_prompt end.
     w_0 = first token of output.
     """
+    os.makedirs(os.path.dirname(save_prefix) or ".", exist_ok=True)
     sequences = []
     skipped = 0
     with open(qa_path, encoding="utf-8") as f:
@@ -200,6 +201,7 @@ def build_datastore(model, tokenizer, text_path,
                     target_layer_index, device,
                     save_prefix, max_length=DEFAULT_MAX_LENGTH,
                     min_ctx=1, use_final_layer=False):
+    os.makedirs(os.path.dirname(save_prefix) or ".", exist_ok=True)
     model.eval()
     chunks = load_text_corpus(text_path, tokenizer, max_length)
     all_keys = []
@@ -259,6 +261,7 @@ def build_qa_knn_datastore(model, tokenizer, qa_path, target_layer_index, device
     max_tokens_per_batch: バッチ内の総トークン数上限（動的バッチ）。
     保存: {save_prefix}_keys.npy, {save_prefix}_vals.npy
     """
+    os.makedirs(os.path.dirname(save_prefix) or ".", exist_ok=True)
     with open(qa_path, encoding="utf-8") as f:
         lines = [l.strip() for l in f if l.strip()]
     if max_samples is not None:
@@ -341,6 +344,7 @@ def build_qa_knn_datastore(model, tokenizer, qa_path, target_layer_index, device
 
 def compute_knn_targets(save_prefix, K=DEFAULT_K, tau=DEFAULT_TAU, batch_size=8192,
                         ncentroids=4096, code_size=64, nprobe=32):
+    os.makedirs(os.path.dirname(save_prefix) or ".", exist_ok=True)
     keys = np.load(save_prefix + "_keys.npy", mmap_mode="r")
     vals = np.load(save_prefix + "_vals.npy", mmap_mode="r")
     dim = keys.shape[1]
@@ -766,6 +770,7 @@ def build_rag_index(model, tokenizer, qa_path, rag_prefix, device, batch_size=51
     """QA JSONL の instruction を token embedding mean-pool で埋め込み FAISS インデックスを構築する。
     保存: {rag_prefix}_rag.index, {rag_prefix}_rag_meta.npy
     """
+    os.makedirs(os.path.dirname(rag_prefix) or ".", exist_ok=True)
     records = []
     with open(qa_path, encoding="utf-8") as f:
         for line in f:

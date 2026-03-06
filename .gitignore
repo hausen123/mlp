@@ -1,3 +1,4 @@
+tmp/
 input.txt
 .venv/
 __pycache__/

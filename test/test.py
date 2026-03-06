@@ -15,10 +15,10 @@ from mlp import (
     MLPMemory,
 )
 
-CORPUS_PATH = "kangaekata.txt"
-SAVE_PREFIX = "test_ds"
+CORPUS_PATH = "data/kangaekata.txt"
+SAVE_PREFIX = "tmp/test_ds"
 QA_PATH = "data/202510301810_250304_kangaekata_rag_workflow.jsonl"
-QA_SAVE_PREFIX = "qa_ds"
+QA_SAVE_PREFIX = "tmp/qa_ds"
 PROMPT = "原子力発電所の耐震設計において"
 
 def load_model():
