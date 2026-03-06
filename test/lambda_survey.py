@@ -18,7 +18,7 @@ from mlp import (
     MLPMemory,
 )
 
-DEFAULT_LAMBDA_VALUES = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+DEFAULT_LAMBDA_VALUES = [0.6, 0.8, 1.0]
 
 def main():
     parser = argparse.ArgumentParser()

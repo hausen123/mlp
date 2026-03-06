@@ -734,6 +734,7 @@ def train_mlp_qa(model, save_prefix, device,
                     input_ids=input_ids_batch,
                     attention_mask=attn_mask_batch,
                     output_hidden_states=True,
+                    logits_to_keep=1,
                 )
             hidden = outputs.hidden_states[target_layer_index].float()  # [B, max_len, H]
             if use_final_layer:

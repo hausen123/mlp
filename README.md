@@ -24,15 +24,27 @@ uv sync
 ```
 
 外部サービス（QA データ生成に必要）:
-- Ollama (`qwen3:14b`) — `http://localhost:11434`
-- E5 embedding API — `http://kawarasaki02.info/embedding/e5`
+- E5 embedding API — `http://kawarasaki02.info/embedding/e5`（RAG インデックス構築）
+- LLM（いずれか）:
+  - Gemini API（推奨・高速）
+  - kawarasaki02 Qwen3 API — `http://kawarasaki02.info/llm/query/`
 
-`.env` に設定:
+`.env` に設定（`LLM_PROVIDER` で切り替え）:
 ```
-OLLAMA_URL=http://localhost:11434
-QWEN_MODEL=qwen3:14b
 API_BASE_URL=http://kawarasaki02.info
+# Gemini を使う場合（推奨）
+LLM_PROVIDER=gemini
+GEMINI_API_KEY=<your_api_key>
+GEMINI_MODEL=gemini-2.0-flash
+# kawarasaki02 を使う場合
+# LLM_PROVIDER=kawarasaki
 ```
+
+**LLM 速度比較（000155788.txt, 1チャンクあたり）:**
+| プロバイダ | 速度 | 100チャンク推定 |
+|-----------|------|---------------|
+| kawarasaki02（Qwen3） | ~7.9分/chunk | ~13時間 |
+| Gemini 2.0 Flash | ~0.9分/chunk | ~1.6時間 |
 
 ## QA データ生成
 
@@ -47,20 +59,23 @@ python test/pdf_to_text.py <URL> [--out data/output.txt]
 ### 2. テキスト → QA JSONL（RAG ワークフロー）
 
 ```bash
-# --mode facts: チャンク → fact 抽出 → 質問生成 → RAG 回答
-python augument.py data/text.txt --mode facts --max-chunks 30 -o data/qa.jsonl
+# --mode facts（推奨）: チャンク → fact 抽出 → 質問生成 → RAG 回答
+uv run python augument.py data/text.txt --mode facts --max-chunks 100
 
-# --mode active: チャンク → ストラテジー → active reading QA
-python augument.py data/text.txt --mode active --max-chunks 30 -o data/qa.jsonl
+# --mode active: チャンク → 学習戦略 → active reading QA（MLP 学習には不適）
+uv run python augument.py data/text.txt --mode active --max-chunks 30
 ```
 
 | 引数 | 説明 |
 |------|------|
 | `filepath` | 入力テキストファイル |
-| `--mode` | `facts`（RAG ワークフロー）または `active`（active reading） |
-| `--max-chunks` | 処理チャンク数の上限（ランダムサンプリング） |
+| `--mode` | `facts`（RAG ワークフロー・推奨）または `active`（active reading） |
+| `--max-chunks` | 処理チャンク数の上限（デフォルト: 先頭から順番） |
+| `--random` | チャンクをランダムサンプリング（省略時は先頭から） |
 | `--output`, `-o` | 出力 JSONL パス（省略時は自動生成） |
 | `--max-tokens`, `-t` | LLM レスポンスの最大トークン数（デフォルト: 2048） |
+
+> **注意**: `--mode active` は学習戦略プロンプトが instruction に混入するため、MLP Memory 学習データには使用しないこと。
 
 ## MLP 学習・推論
 
@@ -147,15 +162,16 @@ uv run python mlp.py --mode rag-infer \
 ### Lambda サーベイ
 
 ```bash
-# λ=0.0〜1.0 で出力を比較
-python test/lambda_survey.py \
+# デフォルト λ=[0.6, 0.8, 1.0] で出力を比較
+uv run python test/lambda_survey.py \
   --model_dir model/YYYYMMDDHHMM_qwen25-05b-instruct-qa \
+  --rag_prefix tmp/rag_000155788 \
   --prompt "基準地震動の策定方法について教えてください。"
 
 # 任意の λ 値を指定
-python test/lambda_survey.py \
+uv run python test/lambda_survey.py \
   --model_dir model/YYYYMMDDHHMM_... \
-  --lambdas 0.5 0.6 0.7 0.8
+  --lambdas 0.6 0.8 1.0
 ```
 
 ## 引数一覧（mlp.py）
@@ -232,7 +248,9 @@ mlp.py              # MLP Memory コア実装
 augument.py         # QA データ生成（RAG ワークフロー）
 src/
   config/settings.py    # 環境変数設定（.env から読込）
-  core/llm_client.py    # Ollama API クライアント
+  core/llm_client.py    # LLM ルーター（.env の LLM_PROVIDER で切替）
+  llm/gemini.py         # Gemini API クライアント
+  llm/kawarasaki.py     # kawarasaki02 Qwen3 API クライアント
   core/vector_db.py     # FAISS + SQLite3 ベクトル DB
   utils/processors.py   # テキスト処理ユーティリティ
 test/

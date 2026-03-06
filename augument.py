@@ -318,7 +318,7 @@ def process_text_file_to_alpaca(filepath: str, output_filename: str = None, max_
     
     print(f"Dataset generation complete. Saved {total_entries} entries to {output_filename}")
 
-async def process_text_file_with_rag_workflow(filepath: str, output_filename: str = None, max_chunks: int = None, random_sample: bool = False, think: bool = False, max_tokens: int = None) -> None:
+async def process_text_file_with_rag_workflow(filepath: str, output_filename: str = None, max_chunks: int = None, start_chunk: int = 1, random_sample: bool = False, think: bool = False, max_tokens: int = None) -> None:
     """テキストファイルを読み込み、Q→RAG→Aのワークフローでアルパカデータセットを生成"""
     from src.core.vector_db import VectorDB
     if not output_filename:
@@ -331,7 +331,7 @@ async def process_text_file_with_rag_workflow(filepath: str, output_filename: st
     print("Splitting text into chunks...")
     all_chunks = split_text(content, 1024)
     print(f"Found {len(all_chunks)} chunks")
-    # VectorDBに登録するチャンク数（デフォルト1000）
+    # VectorDBに登録するチャンク数（デフォルト1000、start_chunkに関係なく全体から構築）
     db_chunks_limit = 1000 if len(all_chunks) > 1000 else len(all_chunks)
     db_chunks = all_chunks[:db_chunks_limit]
     print(f"Using first {db_chunks_limit} chunks for VectorDB")
@@ -347,6 +347,11 @@ async def process_text_file_with_rag_workflow(filepath: str, output_filename: st
     else:
         processing_chunks = all_chunks
         print(f"Processing all {len(processing_chunks)} chunks")
+    # start_chunk（1-indexed）でスキップ
+    chunk_offset = max(0, start_chunk - 1)
+    if chunk_offset > 0:
+        processing_chunks = processing_chunks[chunk_offset:]
+        print(f"Skipping first {chunk_offset} chunks, starting from chunk {start_chunk}")
     # VectorDBを初期化（古いDBとembeddingを消去して全テキストから再構築）
     print("Initializing VectorDB and clearing old data...")
     vector_db = VectorDB()
@@ -356,13 +361,18 @@ async def process_text_file_with_rag_workflow(filepath: str, output_filename: st
     await vector_db.add_text_chunks(db_chunks, source_file=filepath)
     print(f"Added {len(db_chunks)} chunks to VectorDB")
     os.makedirs(os.path.dirname(output_filename), exist_ok=True)
-    with open(output_filename, "w", encoding="utf-8") as f:
-        f.write("")
+    # start_chunk > 1 の場合は既存ファイルに追記、それ以外は新規作成
+    if chunk_offset > 0:
+        print(f"Appending to existing file: {output_filename}")
+    else:
+        with open(output_filename, "w", encoding="utf-8") as f:
+            f.write("")
     import datetime
     total_entries = 0
     qa_count = 0
     start_time = time.time()
     n_chunks = len(processing_chunks)
+    n_total = chunk_offset + n_chunks
     def _ts():
         return datetime.datetime.now().strftime("%H:%M:%S")
     def _eta(i):
@@ -376,8 +386,9 @@ async def process_text_file_with_rag_workflow(filepath: str, output_filename: st
     for i, chunk_text in enumerate(processing_chunks):
         try:
             chunk_text = remove_until_parenthesis(chunk_text)
-            pct = (i + 1) / n_chunks * 100
-            print(f"[{_ts()}] chunk {i+1}/{n_chunks} ({pct:.0f}%) ETA:{_eta(i)} QA累計:{qa_count}")
+            abs_chunk = chunk_offset + i + 1
+            pct = abs_chunk / n_total * 100
+            print(f"[{_ts()}] chunk {abs_chunk}/{n_total} ({pct:.0f}%) ETA:{_eta(i)} QA累計:{qa_count}")
             print("Chunk preview:", chunk_text[:100] + "..." if len(chunk_text) > 100 else chunk_text)
             # fact distillationを実行
             facts_response = fact_distillation(chunk_text, think=think, max_tokens=max_tokens)
@@ -415,7 +426,7 @@ async def process_text_file_with_rag_workflow(filepath: str, output_filename: st
                         print(f"Saved Q&A pair: Q={question[:30]}...")
             total_entries += 1
             elapsed = time.time() - start_time
-            print(f"[{_ts()}] chunk {i+1}/{n_chunks} 完了 ({(i+1)/n_chunks*100:.0f}%) elapsed:{elapsed/60:.1f}分 ETA:{_eta(i+1)} QA累計:{qa_count}")
+            print(f"[{_ts()}] chunk {abs_chunk}/{n_total} 完了 ({abs_chunk/n_total*100:.0f}%) elapsed:{elapsed/60:.1f}分 ETA:{_eta(i+1)} QA累計:{qa_count}")
         except Exception as e:
             print(f"[{_ts()}] Error processing chunk {i+1}: {e}")
             continue
@@ -587,6 +598,8 @@ if __name__ == '__main__':
     parser.add_argument('--max-tokens', '-t', type=int, default=2048, help='Maximum tokens per response')
     parser.add_argument('--mode', choices=['facts', 'active'], default='active',
                        help='Dataset type: facts for fact distillation, active for active reading (default: active)')
+    parser.add_argument('--start-chunk', type=int, default=1,
+                       help='Start processing from this chunk number (1-indexed, default: 1). Appends to existing output file.')
     parser.add_argument('--random', action='store_true',
                        help='Randomly sample max_chunks instead of taking from the beginning (default: sequential)')
     
@@ -599,6 +612,7 @@ if __name__ == '__main__':
             filepath=args.filepath,
             output_filename=args.output,
             max_chunks=args.max_chunks,
+            start_chunk=args.start_chunk,
             random_sample=args.random,
             think=False,
             max_tokens=args.max_tokens
