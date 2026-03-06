@@ -14,6 +14,7 @@ from mlp import (
     DEFAULT_MODEL_NAME,
     DEFAULT_MAX_NEW_TOKENS,
     inference_mlp,
+    inference_rag,
     MLPMemory,
 )
 
@@ -24,6 +25,7 @@ def main():
     parser.add_argument("--prompt", type=str, default="基準地震動の策定方法について教えてください。")
     parser.add_argument("--model_dir", type=str, default=None)
     parser.add_argument("--lambdas", type=float, nargs="+", default=None)
+    parser.add_argument("--rag_prefix", type=str, default=None, help="RAGインデックスのプレフィックス（省略時はRAGをスキップ）")
     args = parser.parse_args()
     lambda_values = args.lambdas if args.lambdas is not None else DEFAULT_LAMBDA_VALUES
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -54,6 +56,21 @@ def main():
     lines.append(f"Model: {save_dir}")
     lines.append(f"Prompt: {args.prompt}")
     lines.append("=" * 60)
+    if args.rag_prefix:
+        print("\n--- RAG baseline ---")
+        try:
+            rag_out = inference_rag(
+                model, tokenizer, args.prompt, args.rag_prefix,
+                max_new_tokens=DEFAULT_MAX_NEW_TOKENS,
+                device=device,
+            )
+            rag_result = rag_out[0] if isinstance(rag_out, tuple) else rag_out
+            print(rag_result)
+            lines.append("\n[RAG baseline]")
+            lines.append(rag_result)
+            lines.append("-" * 60)
+        except Exception as e:
+            print(f"RAG inference failed: {e}")
     for lam in lambda_values:
         print(f"\n--- lambda={lam} ---")
         result = inference_mlp(

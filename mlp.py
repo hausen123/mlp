@@ -597,10 +597,13 @@ def train_mlp(model, save_prefix, device,
     ckpt_dir = _make_ckpt_dir(model_name or "mlp-memory") if checkpoint_every > 0 else None
     if ckpt_dir:
         print(f"Checkpoint dir: {ckpt_dir}")
+    import datetime
     mlp.train()
+    train_start = time.time()
     for epoch in range(epochs):
+        epoch_start = time.time()
         total_loss = 0
-        for keys, true_token, target_dicts in tqdm(loader, desc=f"Epoch {epoch+1}"):
+        for keys, true_token, target_dicts in tqdm(loader, desc=f"Epoch {epoch+1}/{epochs}"):
             keys = keys.to(device)
             true_token = true_token.to(device)
             logits = mlp(keys)
@@ -625,7 +628,17 @@ def train_mlp(model, save_prefix, device,
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
-        print(f"Epoch {epoch+1}: {total_loss/len(loader)}")
+        epoch_elapsed = time.time() - epoch_start
+        total_elapsed = time.time() - train_start
+        epochs_done = epoch + 1
+        epochs_left = epochs - epochs_done
+        eta_sec = epoch_elapsed * epochs_left
+        eta_str = (datetime.datetime.now() + datetime.timedelta(seconds=eta_sec)).strftime("%H:%M")
+        mem_gb = torch.cuda.memory_reserved() / 1e9 if torch.cuda.is_available() else 0
+        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Epoch {epochs_done}/{epochs} "
+              f"loss={total_loss/len(loader):.4f} "
+              f"epoch={epoch_elapsed:.0f}s total={total_elapsed/60:.1f}min "
+              f"ETA={eta_str} GPU={mem_gb:.1f}GB")
         if ckpt_dir and (epoch + 1) % checkpoint_every == 0:
             mlp.save_pretrained(ckpt_dir)
             print(f"Checkpoint saved to {ckpt_dir}")
@@ -682,8 +695,11 @@ def train_mlp_qa(model, save_prefix, device,
     ckpt_dir = _make_ckpt_dir((model_name or "mlp-memory") + "-qa") if checkpoint_every > 0 else None
     if ckpt_dir:
         print(f"Checkpoint dir: {ckpt_dir}")
+    import datetime
     indices = list(range(len(sequences)))
+    train_start = time.time()
     for epoch in range(epochs):
+        epoch_start = time.time()
         random.shuffle(indices)
         total_loss = 0.0
         n_batches = 0
@@ -691,7 +707,7 @@ def train_mlp_qa(model, save_prefix, device,
         mlp.train()
         for batch_start in tqdm(
             range(0, len(indices), batch_size),
-            desc=f"Epoch {epoch+1}"
+            desc=f"Epoch {epoch+1}/{epochs}"
         ):
             batch_idx = indices[batch_start:batch_start + batch_size]
             batch_seqs = [sequences[i] for i in batch_idx]
@@ -753,7 +769,17 @@ def train_mlp_qa(model, save_prefix, device,
             optimizer.step()
             total_loss += accum_loss
             n_batches += 1
-        print(f"Epoch {epoch+1}: {total_loss / max(n_batches, 1):.4f}")
+        epoch_elapsed = time.time() - epoch_start
+        total_elapsed = time.time() - train_start
+        epochs_done = epoch + 1
+        epochs_left = epochs - epochs_done
+        eta_sec = epoch_elapsed * epochs_left
+        eta_str = (datetime.datetime.now() + datetime.timedelta(seconds=eta_sec)).strftime("%H:%M")
+        mem_gb = torch.cuda.memory_reserved() / 1e9 if torch.cuda.is_available() else 0
+        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Epoch {epochs_done}/{epochs} "
+              f"loss={total_loss / max(n_batches, 1):.4f} "
+              f"epoch={epoch_elapsed:.0f}s total={total_elapsed/60:.1f}min "
+              f"ETA={eta_str} GPU={mem_gb:.1f}GB")
         if ckpt_dir and (epoch + 1) % checkpoint_every == 0:
             mlp.save_pretrained(ckpt_dir)
             print(f"Checkpoint saved to {ckpt_dir}")
