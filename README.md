@@ -15,7 +15,8 @@ p_final = λ * p_MLP + (1 - λ) * p_LM
 | **kNN** | コーパスから構築した kNN トークン分布 | FAISS 索引が必要 |
 | **QA** | QA ペアの出力トークン（CE loss） | FAISS 不要、JSONL から直接学習 |
 | **QA-kNN** | QA コーパスから構築した kNN 分布 | QA + FAISS |
-| **RAG** | kNN ベースのベクトル検索 | クエリに応じた文書検索 |
+
+なお、比較用のベースラインとしてRAG回答作成機能も実装済み。
 
 ## セットアップ
 
@@ -26,26 +27,21 @@ uv sync
 外部サービス（QA データ生成に必要）:
 - E5 embedding API — `http://kawarasaki02.info/embedding/e5`（RAG インデックス構築）
 - LLM（いずれか）:
-  - Gemini API（推奨・高速）
   - kawarasaki02 Qwen3 API — `http://kawarasaki02.info/llm/query/`
+  - Gemini API（非推奨!! 学習モデルと異なるため正しいLOSS信号が得られない!!）
 
 `.env` に設定（`LLM_PROVIDER` で切り替え）:
 ```
 API_BASE_URL=http://kawarasaki02.info
-# Gemini を使う場合（推奨）
+
+# kawarasaki02 を使う場合
+LLM_PROVIDER=kawarasaki
+
+# Gemini を使う場合
 LLM_PROVIDER=gemini
 GEMINI_API_KEY=<your_api_key>
 GEMINI_MODEL=gemini-2.0-flash
-# kawarasaki02 を使う場合
-# LLM_PROVIDER=kawarasaki
 ```
-
-**LLM 速度比較（000155788.txt, 1チャンクあたり）:**
-| プロバイダ | 速度 | 100チャンク推定 |
-|-----------|------|---------------|
-| kawarasaki02（Qwen3） | ~7.9分/chunk | ~13時間 |
-| Gemini 2.0 Flash | ~0.9分/chunk | ~1.6時間 |
-
 ## QA データ生成
 
 PDF からテキストを抽出して QA JSONL を生成するまでの一連のフロー。
@@ -95,16 +91,10 @@ uv run python mlp.py --mode infer \
 ### QA 学習
 
 ```bash
-# QA JSONL から直接学習（トークナイズは内部で自動処理）
+# QA JSONL から直接学習
 uv run python mlp.py --mode qa-train \
   --qa_path data/qa.jsonl \
   --epochs 20 \
-  -m "コメント（必須）"
-
-# 一括実行（学習 → infer）
-uv run python mlp.py --mode qa-full \
-  --qa_path data/qa.jsonl \
-  --prompt "基準地震動の策定方法について教えてください。" \
   -m "コメント（必須）"
 ```
 
@@ -115,7 +105,7 @@ uv run python mlp.py --mode qa-train \
   --qa_path data/qa.jsonl \
   --resume_from model/YYYYMMDDHHMM_qwen25-05b-instruct-qa \
   --epochs 10 \
-  -m "continued training: +10 epochs"
+  -m "resume from model/YYYYMMDDHHMM_qwen25-05b-instruct-qa. training: +10 epochs"
 ```
 
 アーキテクチャ（`num_layers` / `use_final_layer` / `target_layer_index`）が一致しない場合はエラーを表示して終了。
