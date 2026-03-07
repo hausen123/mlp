@@ -60,7 +60,7 @@ class VectorDB:
             埋め込みベクトル (numpy配列) または None
         """
         from src.config.settings import Config
-        url = f'{Config.API_BASE_URL}/embedding/e5'
+        url = Config.E5_EMBEDDING_URL
         payload = {'query': text}
         try:
             async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
