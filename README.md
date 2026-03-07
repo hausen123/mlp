@@ -95,18 +95,13 @@ uv run python mlp.py --mode infer \
 ### QA 学習
 
 ```bash
-# Step 1: QA JSONL をトークナイズして保存（モデルロード不要）
-uv run python mlp.py --mode qa-build \
-  --qa_path data/qa.jsonl \
-  --qa_prefix tmp/qa_ds
-
-# Step 2: MLP を QA で学習
+# QA JSONL から直接学習（トークナイズは内部で自動処理）
 uv run python mlp.py --mode qa-train \
-  --qa_prefix tmp/qa_ds \
+  --qa_path data/qa.jsonl \
   --epochs 20 \
   -m "コメント（必須）"
 
-# 一括実行（qa-build → qa-train → infer）
+# 一括実行（学習 → infer）
 uv run python mlp.py --mode qa-full \
   --qa_path data/qa.jsonl \
   --prompt "基準地震動の策定方法について教えてください。" \
@@ -117,7 +112,7 @@ uv run python mlp.py --mode qa-full \
 
 ```bash
 uv run python mlp.py --mode qa-train \
-  --qa_prefix tmp/qa_ds_full \
+  --qa_path data/qa.jsonl \
   --resume_from model/YYYYMMDDHHMM_qwen25-05b-instruct-qa \
   --epochs 10 \
   -m "continued training: +10 epochs"
@@ -131,7 +126,6 @@ uv run python mlp.py --mode qa-train \
 # 一括実行（qa-knn-build → knn → train → infer）
 uv run python mlp.py --mode qa-knn-full \
   --qa_path data/qa.jsonl \
-  --qa_prefix tmp/qa_knn_ds \
   -m "コメント（必須）"
 ```
 
@@ -183,9 +177,9 @@ uv run python test/lambda_survey.py \
 | `--model_dir` | `None` | 保存済み MLPMemory ディレクトリ（`infer` 時に必須） |
 | `--corpus` | `None` | テキストコーパス（`build`/`full` 時に必須） |
 | `--save_prefix` | `tmp/datastore` | kNN datastore のプレフィックス |
-| `--qa_path` | `None` | QA JSONL ファイル |
-| `--qa_prefix` | `tmp/qa_ds` | QA datastore のプレフィックス |
+| `--qa_path` | `None` | QA JSONL ファイル（`qa-train`/`qa-full`/`qa-knn-full` 時に必須） |
 | `--max_samples` | `None` | QA サンプル数の上限（省略時は全件） |
+| `--rag_prefix` | `tmp/rag` | RAG インデックスのプレフィックス |
 | `--epochs` | `20` | 訓練エポック数 |
 | `--batch_size` | `64` | 訓練バッチサイズ |
 | `--num_layers` | `22` | MLP の残差ブロック数 |
@@ -211,11 +205,9 @@ uv run python test/lambda_survey.py \
 | `train` | kNN 方式で MLP 訓練 |
 | `infer` | 推論 |
 | `full` | build → knn → train → infer |
-| `qa-build` | QA JSONL をトークナイズ |
-| `qa-train` | QA 方式で MLP 訓練 |
-| `qa-full` | qa-build → qa-train → infer |
-| `qa-knn-build` | QA コーパスからデータストア構築 |
-| `qa-knn-full` | qa-knn-build → knn → train → infer |
+| `qa-train` | QA JSONL から直接 MLP 訓練（`--qa_path` 必須） |
+| `qa-full` | qa-train → infer（`--qa_path` 必須） |
+| `qa-knn-full` | QA-kNN 学習 → infer（`--qa_path` 必須） |
 | `rag-build` | RAG 用ベクトルインデックス構築 |
 | `rag-infer` | RAG ベクトル検索で推論 |
 
@@ -269,8 +261,7 @@ model/              # 訓練済みモデル（gitignore）
 | `tmp/{prefix}_keys.npy` | 隠れ状態ベクトル（kNN 方式） |
 | `tmp/{prefix}_vals.npy` | 次トークン ID（kNN 方式） |
 | `tmp/{prefix}_targets.npy` | kNN トークン分布（kNN 方式） |
-| `tmp/{prefix}_qa_plens.npy` | プロンプト長（QA 方式） |
-| `tmp/{prefix}_qa_ids.npy` | トークン ID 配列（QA 方式） |
+| `tmp/.qa_cache_*/` | QA トークナイズキャッシュ（自動生成・内部利用） |
 | `data/text_vectors.db` | RAG 用 SQLite3 DB |
 | `data/text_vectors.faiss` | RAG 用 FAISS インデックス |
 | `model/YYYYMMDDHHMM_*/` | 訓練済み MLPMemory |

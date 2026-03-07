@@ -42,13 +42,13 @@ def parse_args():
     )
     parser.add_argument("--mode", type=str, default="infer",
                         choices=["build", "knn", "train", "infer", "full",
-                                 "qa-build", "qa-train", "qa-full",
-                                 "qa-knn-build", "qa-knn-full",
+                                 "qa-train", "qa-full",
+                                 "qa-knn-full",
                                  "rag-build", "rag-infer"],
                         help=(
                             "build/knn/train/infer/full: kNN workflow on text corpus. "
-                            "qa-build/qa-train/qa-full: QA CE-loss workflow. "
-                            "qa-knn-build/qa-knn-full: kNN workflow on QA JSONL."
+                            "qa-train/qa-full: QA CE-loss workflow (--qa_path required). "
+                            "qa-knn-full: kNN workflow on QA JSONL."
                         ))
     # model
     parser.add_argument("--model_name", type=str, default=DEFAULT_MODEL_NAME)
@@ -65,9 +65,7 @@ def parse_args():
     parser.add_argument("--alpha", type=float, default=DEFAULT_ALPHA)
     # QA datastore
     parser.add_argument("--qa_path", type=str, default=None,
-                        help="QA JSONL ファイル (qa-build/qa-full 時に必須)")
-    parser.add_argument("--qa_prefix", type=str, default="tmp/qa_ds",
-                        help="QA datastore の保存プレフィックス")
+                        help="QA JSONL ファイル (qa-train/qa-full 時に必須)")
     parser.add_argument("--max_samples", type=int, default=None,
                         help="QA サンプル数の上限 (省略時は全件)")
     # training
@@ -88,11 +86,13 @@ def parse_args():
     parser.add_argument("--skip_base_lm", action="store_true",
                         help="推論時に Base LM の出力をスキップする")
     parser.add_argument("--use_final_layer", action="store_true",
-                        help="70%層に加えて最終隠れ層も足し合わせて MLP に入力する")
+                        help="70%%層に加えて最終隠れ層も足し合わせて MLP に入力する")
     parser.add_argument("--resume_from", type=str, default=None,
                         help="継続学習するモデルディレクトリ（アーキテクチャが一致しない場合はエラー）")
     parser.add_argument("-m", "--comment", type=str, default=None,
                         help="モデル保存時のコメント（train/qa-train/full/qa-full 時は必須）")
+    parser.add_argument("--rag_prefix", type=str, default="tmp/rag",
+                        help="RAG インデックスの保存プレフィックス")
     parser.add_argument("--rag_k", type=int, default=DEFAULT_RAG_K,
                         help="RAG 検索時の top-k 件数")
     return parser.parse_args()
@@ -652,7 +652,7 @@ def train_mlp(model, save_prefix, device,
 # QA Training (CE loss only, no kNN / FAISS)
 # =========================================================
 
-def train_mlp_qa(model, save_prefix, device,
+def train_mlp_qa(model, tokenizer, qa_path, device,
                  model_name=None,
                  target_layer_index=None,
                  batch_size=DEFAULT_BATCH_SIZE,
@@ -662,6 +662,7 @@ def train_mlp_qa(model, save_prefix, device,
                  use_final_layer=False,
                  resume_from=None,
                  checkpoint_every=3,
+                 max_samples=None,
                  comment=""):
     """Train MLP Memory on QA pairs with online LM inference and CE loss.
     For each batch:
@@ -671,8 +672,12 @@ def train_mlp_qa(model, save_prefix, device,
       3. Compute CE(MLP(keys), targets) and update only the MLP.
     No kNN / FAISS required.
     """
-    prompt_lens = np.load(save_prefix + "_qa_plens.npy")
-    full_ids_arr = np.load(save_prefix + "_qa_ids.npy", allow_pickle=True)
+    import hashlib
+    _cache_key = hashlib.md5(qa_path.encode()).hexdigest()[:8]
+    _cache_prefix = f"tmp/.qa_cache_{_cache_key}"
+    build_qa_datastore(tokenizer, qa_path, _cache_prefix, max_samples=max_samples)
+    prompt_lens = np.load(_cache_prefix + "_qa_plens.npy")
+    full_ids_arr = np.load(_cache_prefix + "_qa_ids.npy", allow_pickle=True)
     sequences = list(zip(prompt_lens.tolist(), full_ids_arr))
     hidden_dim = model.config.hidden_size
     embed_weight = model.get_input_embeddings().weight.detach()
@@ -683,6 +688,12 @@ def train_mlp_qa(model, save_prefix, device,
         num_layers=num_layers,
         target_layer_index=target_layer_index or 0,
         use_final_layer=use_final_layer,
+        training={
+            "qa_path": qa_path,
+            "batch_size": batch_size,
+            "epochs": epochs,
+            "resume_from": resume_from,
+        },
         comment=comment,
     )
     if resume_from:
@@ -977,18 +988,16 @@ def main():
     args = parse_args()
     if args.mode in ["build", "full"] and args.corpus is None:
         raise ValueError("--corpus is required for mode 'build' or 'full'")
-    if args.mode in ["qa-build", "qa-full"] and args.qa_path is None:
-        raise ValueError("--qa_path is required for mode 'qa-build' or 'qa-full'")
+    if args.mode in ["qa-train", "qa-full", "qa-knn-full"] and args.qa_path is None:
+        raise ValueError("--qa_path is required for mode 'qa-train', 'qa-full', or 'qa-knn-full'")
     if args.mode in ["train", "full", "qa-train", "qa-full", "qa-knn-full"] and not args.comment:
         raise ValueError("-m/--comment is required for training modes")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_name, trust_remote_code=True
     )
-    # qa-build / knn はモデル不要
-    need_model = args.mode not in ("qa-build", "knn")
-    if args.mode in ["qa-knn-build", "qa-full"] and args.qa_path is None:
-        raise ValueError("--qa_path is required for mode 'qa-knn-build' or 'qa-knn-full'")
+    # knn はモデル不要
+    need_model = args.mode not in ("knn",)
     model = None
     target_layer_index = None
     if need_model:
@@ -1032,14 +1041,9 @@ def main():
             comment=args.comment,
         )
     # --- QA workflow ---
-    if args.mode in ["qa-build", "qa-full"]:
-        build_qa_datastore(
-            tokenizer, args.qa_path, args.qa_prefix,
-            max_samples=args.max_samples,
-        )
     if args.mode in ["qa-train", "qa-full"]:
         mlp, save_dir = train_mlp_qa(
-            model, args.qa_prefix, device,
+            model, tokenizer, args.qa_path, device,
             model_name=args.model_name,
             target_layer_index=target_layer_index,
             batch_size=args.batch_size,
@@ -1049,21 +1053,23 @@ def main():
             use_final_layer=args.use_final_layer,
             resume_from=args.resume_from,
             checkpoint_every=args.checkpoint_every,
+            max_samples=args.max_samples,
             comment=args.comment,
         )
     # --- QA kNN workflow ---
-    if args.mode in ["qa-knn-build", "qa-knn-full"]:
+    import hashlib
+    _qa_knn_prefix = f"tmp/.qa_knn_cache_{hashlib.md5((args.qa_path or '').encode()).hexdigest()[:8]}" if args.qa_path else "tmp/qa_knn_ds"
+    if args.mode in ["qa-knn-full"]:
         build_qa_knn_datastore(
             model, tokenizer, args.qa_path, target_layer_index, device,
-            args.qa_prefix,
+            _qa_knn_prefix,
             max_tokens_per_batch=args.max_tokens_per_batch,
             use_final_layer=args.use_final_layer,
             max_samples=args.max_samples,
         )
-    if args.mode in ["qa-knn-full"]:
-        compute_knn_targets(args.qa_prefix, args.K, args.tau)
+        compute_knn_targets(_qa_knn_prefix, args.K, args.tau)
         mlp, save_dir = train_mlp(
-            model, args.qa_prefix, device,
+            model, _qa_knn_prefix, device,
             model_name=args.model_name,
             target_layer_index=target_layer_index,
             alpha=args.alpha,
@@ -1082,11 +1088,11 @@ def main():
     if args.mode == "rag-build":
         if args.qa_path is None:
             raise ValueError("--qa_path is required for mode 'rag-build'")
-        build_rag_index(model, tokenizer, args.qa_path, args.qa_prefix, device)
+        build_rag_index(model, tokenizer, args.qa_path, args.rag_prefix, device)
     if args.mode == "rag-infer":
         print("\n=== RAG ===")
         result, retrieved = inference_rag(
-            model, tokenizer, args.prompt, args.qa_prefix,
+            model, tokenizer, args.prompt, args.rag_prefix,
             k=args.rag_k,
             max_new_tokens=args.max_new_tokens,
             device=device,

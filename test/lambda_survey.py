@@ -26,6 +26,7 @@ def main():
     parser.add_argument("--model_dir", type=str, default=None)
     parser.add_argument("--lambdas", type=float, nargs="+", default=None)
     parser.add_argument("--rag_prefix", type=str, default=None, help="RAGインデックスのプレフィックス（省略時はRAGをスキップ）")
+    parser.add_argument("--output", "-o", type=str, default=None, help="出力ファイルパス（省略時は自動生成）")
     args = parser.parse_args()
     lambda_values = args.lambdas if args.lambdas is not None else DEFAULT_LAMBDA_VALUES
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -50,7 +51,7 @@ def main():
     target_layer_index = mlp.config.target_layer_index
     use_final_layer = getattr(mlp.config, "use_final_layer", False)
     print(f"Target layer: {target_layer_index}, use_final_layer: {use_final_layer}")
-    out_path = Path(__file__).parent / f"lambda_survey_{datetime.now().strftime('%Y%m%d%H%M')}.txt"
+    out_path = Path(args.output) if args.output else Path(__file__).parent / f"lambda_survey_{datetime.now().strftime('%Y%m%d%H%M')}.txt"
     lines = []
     lines.append(f"Lambda survey — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     lines.append(f"Model: {save_dir}")
