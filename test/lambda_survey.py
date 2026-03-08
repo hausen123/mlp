@@ -2,6 +2,7 @@
 Lambda interpolation survey.
 Runs inference_mlp over lambda values and writes all outputs to test/lambda_survey_YYYYMMDDHHММ.txt.
 """
+import os
 import sys
 import glob
 import argparse
@@ -15,6 +16,7 @@ from mlp import (
     DEFAULT_MAX_NEW_TOKENS,
     inference_mlp,
     inference_rag,
+    build_rag_index,
     MLPMemory,
 )
 
@@ -26,6 +28,7 @@ def main():
     parser.add_argument("--model_dir", type=str, default=None)
     parser.add_argument("--lambdas", type=float, nargs="+", default=None)
     parser.add_argument("--rag_prefix", type=str, default=None, help="RAGインデックスのプレフィックス（省略時はRAGをスキップ）")
+    parser.add_argument("--qa_path", type=str, default=None, help="RAGインデックス構築用 QA JSONL（インデックス未存在時に自動構築）")
     parser.add_argument("--output", "-o", type=str, default=None, help="出力ファイルパス（省略時は自動生成）")
     args = parser.parse_args()
     lambda_values = args.lambdas if args.lambdas is not None else DEFAULT_LAMBDA_VALUES
@@ -58,6 +61,12 @@ def main():
     lines.append(f"Prompt: {args.prompt}")
     lines.append("=" * 60)
     if args.rag_prefix:
+        index_path = args.rag_prefix + "_rag.index"
+        if not os.path.exists(index_path):
+            if args.qa_path is None:
+                raise ValueError(f"RAG index not found: {index_path}. Specify --qa_path to build it.")
+            print(f"RAG index not found. Building from {args.qa_path} ...")
+            build_rag_index(model, tokenizer, args.qa_path, args.rag_prefix, device)
         print("\n--- RAG baseline ---")
         try:
             rag_out = inference_rag(

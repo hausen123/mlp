@@ -643,7 +643,9 @@ def train_mlp(model, save_prefix, device,
         if ckpt_dir and (epoch + 1) % checkpoint_every == 0:
             mlp.save_pretrained(ckpt_dir)
             print(f"Checkpoint saved to {ckpt_dir}")
+    final_loss = total_loss / len(loader)
     save_dir = _make_save_dir(model_name or "mlp-memory")
+    mlp.config.training["final_loss"] = round(final_loss, 6)
     mlp.save_pretrained(save_dir)
     return mlp, save_dir
 
@@ -796,8 +798,11 @@ def train_mlp_qa(model, tokenizer, qa_path, device,
         if ckpt_dir and (epoch + 1) % checkpoint_every == 0:
             mlp.save_pretrained(ckpt_dir)
             print(f"Checkpoint saved to {ckpt_dir}")
+    final_loss = total_loss / max(n_batches, 1)
     save_dir = _make_save_dir((model_name or "mlp-memory") + "-qa")
+    mlp.config.training["final_loss"] = round(final_loss, 6)
     mlp.save_pretrained(save_dir)
+    print(f"Saved to {save_dir}")
     return mlp, save_dir
 
 
