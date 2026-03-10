@@ -11,3 +11,5 @@ class Config:
     OLLAMA_URL: Optional[str] = os.getenv("OLLAMA_URL")
     QWEN_MODEL: Optional[str] = os.getenv("QWEN_MODEL")
     E5_EMBEDDING_URL: Optional[str] = os.getenv("E5_EMBEDDING_URL")
+    GEMINI_API_KEY: Optional[str] = os.getenv("GEMINI_API_KEY")
+    GEMINI_MODEL: Optional[str] = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")

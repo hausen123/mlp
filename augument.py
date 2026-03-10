@@ -192,7 +192,7 @@ def parse_questions(questions_output: str) -> list:
             questions.append(question)
     return questions
 
-def create_qa_pair_json(question: str, answer: str, fact: str = "") -> str:
+def create_qa_pair_json(question: str, answer: str, fact: str = "", chunk_id: int = None) -> str:
     """質問と回答からAlpaca形式のJSONを作成する"""
     import json
     import re
@@ -206,6 +206,8 @@ def create_qa_pair_json(question: str, answer: str, fact: str = "") -> str:
         "input": fact,
         "output": answer
     }
+    if chunk_id is not None:
+        qa_entry["chunk_id"] = chunk_id
     return json.dumps(qa_entry, ensure_ascii=False)
 
 def parse_qa_pairs(qa_output: str, fact: str = "") -> list:
@@ -237,6 +239,130 @@ def parse_qa_pairs(qa_output: str, fact: str = "") -> list:
             }
             qa_json_list.append(json.dumps(qa_entry, ensure_ascii=False))
     return qa_json_list
+
+def _augment_generate(prompt, max_tokens=None):
+    from src.llm.gemini import generate_response
+    return generate_response(prompt, max_tokens=max_tokens)
+
+def _parse_jsonl_response(res):
+    import re, json
+    block = re.search(r'<OUTPUT>(.*?)</OUTPUT>', res, re.DOTALL)
+    text = block.group(1) if block else res
+    items = []
+    for line in text.splitlines():
+        line = line.strip().lstrip('`')
+        if not line or line.startswith('jsonl'):
+            continue
+        try:
+            items.append(json.loads(line)["text"].strip())
+        except Exception:
+            pass
+    return items
+
+def permute_sentence(sentence, max_tokens=None):
+    import re, json
+    prompt = f"""以下の<INPUT>の内容を維持しながら、文の順序を入れ替えて、新しい流れを作成してください。
+言葉遣いや表現は、元の意味を損なわない範囲で適宜調整してください。
+主語を省略せずに明記し、文章が自然に読み取れるよう工夫してください。
+出力は、以下のjsonl形式に従って<OUTPUT></OUTPUT>の中に出力してください。
+
+Example:
+
+<INPUT>
+この文章を言い換える。
+</INPUT>
+
+<OUTPUT>
+{{"version": 1, "text": "順序を入れ替えた1つ目のバリエーション"}}
+{{"version": 2, "text": "順序を入れ替えた2つ目のバリエーション"}}
+{{"version": 3, "text": "順序を入れ替えた3つ目のバリエーション"}}
+</OUTPUT>
+
+Your task:
+
+<INPUT>
+{sentence}
+</INPUT>
+
+"""
+    try:
+        res = _augment_generate(prompt, max_tokens=max_tokens)
+        items = _parse_jsonl_response(res)
+        #print(f"[DEBUG] permute: {len(items)} items parsed")
+        return [sentence] + items if items else [sentence]
+    except Exception as e:
+        print(f"permute_sentence ERROR: {e}")
+        return [sentence]
+
+def multiply_sentence(sentence, max_tokens=None):
+    import re, json
+    prompt = f"""以下の<INPUT>を、内容の意味と情報量を維持したまま、5通りに言い換えてください。
+各文において、主語を省略せずに明記し、一貫性と自然な文章構成を保つようにしてください。
+特に、指示語や文脈上省略されがちな主語についても、具体的な名称を明確に記述してください。
+出力は、以下のjsonl形式に従って<OUTPUT></OUTPUT>の中に出力してください。
+
+Example:
+
+<INPUT>
+この文章を言い換える。
+</INPUT>
+
+<OUTPUT>
+{{"version": 1, "text": "1つ目の言い換えたテキスト"}}
+{{"version": 2, "text": "2つ目の言い換えたテキスト"}}
+{{"version": 3, "text": "3つ目の言い換えたテキスト"}}
+{{"version": 4, "text": "4つ目の言い換えたテキスト"}}
+{{"version": 5, "text": "5つ目の言い換えたテキスト"}}
+</OUTPUT>
+
+Your task:
+
+<INPUT>
+{sentence}
+</INPUT>
+
+"""
+    try:
+        res = _augment_generate(prompt, max_tokens=max_tokens)
+        items = _parse_jsonl_response(res)
+        #print(f"[DEBUG] multiply: {len(items)} items parsed")
+        return [sentence] + items if items else [sentence]
+    except Exception as e:
+        print(f"multiply_sentence ERROR: {e}")
+        return [sentence]
+
+def augment_sentence(sentence, max_tokens=None):
+    result = []
+    permuted = permute_sentence(sentence, max_tokens=max_tokens)
+    #print(f"[DEBUG] augment_sentence: permute={len(permuted)}")
+    for s in permuted:
+        m = multiply_sentence(s, max_tokens=max_tokens)
+        result += m
+    #print(f"[DEBUG] augment_sentence: total={len(result)}")
+    return result
+
+def augment_text_file(filepath, output_filepath=None, max_chunks=None, max_tokens=1024):
+    if not output_filepath:
+        base = os.path.splitext(os.path.basename(filepath))[0]
+        timestamp = time.strftime("%Y%m%d%H%M", time.localtime())
+        output_filepath = f"data/{timestamp}_{base}_augmented.txt"
+    with open(filepath, encoding='utf-8') as f:
+        content = f.read()
+    chunks = split_text(content, 1024)
+    if max_chunks:
+        chunks = chunks[:max_chunks]
+    print(f"Augmenting {len(chunks)} chunks → {output_filepath}")
+    _warmup = chunks[0] if chunks else "テスト"
+    _augment_generate(f"以下のTextを言い換えてください。\n\nText:\n{_warmup}", max_tokens=max_tokens)
+    with open(output_filepath, 'w', encoding='utf-8') as out:
+        for i, chunk in enumerate(chunks):
+            chunk = remove_until_parenthesis(chunk)
+            print(f"[{i+1}/{len(chunks)}] {chunk[:60]}...")
+            variants = augment_sentence(chunk, max_tokens=max_tokens)
+            for v in variants:
+                out.write(v.strip() + '\n')
+    print(f"Done. Saved to {output_filepath}")
+    return output_filepath
 
 def split_text(input_str, max_length):
     """テキストを句点区切りで指定長以下のチャンクに分割"""
@@ -419,7 +545,7 @@ async def process_text_file_with_rag_workflow(filepath: str, output_filename: st
                     answer = await generate_answer_with_rag(question, fact, vector_db=vector_db, k=3, think=think, max_tokens=max_tokens)
                     if answer:
                         # Step 4: Q&Aペアを保存
-                        qa_json = create_qa_pair_json(question, answer, fact)
+                        qa_json = create_qa_pair_json(question, answer, fact, chunk_id=abs_chunk)
                         with open(output_filename, "a", encoding="utf-8") as f:
                             f.write(qa_json + "\n")
                         qa_count += 1
@@ -596,8 +722,8 @@ if __name__ == '__main__':
     parser.add_argument('--output', '-o', help='Output JSONL file path (optional)')
     parser.add_argument('--max-chunks', '-c', type=int, help='Maximum number of chunks to process')
     parser.add_argument('--max-tokens', '-t', type=int, default=2048, help='Maximum tokens per response')
-    parser.add_argument('--mode', choices=['facts', 'active'], default='active',
-                       help='Dataset type: facts for fact distillation, active for active reading (default: active)')
+    parser.add_argument('--mode', choices=['facts', 'active', 'augment'], default='facts',
+                       help='Dataset type: facts for fact distillation, active for active reading, augment for text augmentation (default: facts)')
     parser.add_argument('--start-chunk', type=int, default=1,
                        help='Start processing from this chunk number (1-indexed, default: 1). Appends to existing output file.')
     parser.add_argument('--random', action='store_true',
@@ -625,4 +751,12 @@ if __name__ == '__main__':
             max_chunks=args.max_chunks,
             think=False,
             max_tokens=args.max_tokens
+        )
+    elif args.mode == 'augment':
+        print("Augmenting text file...")
+        augment_text_file(
+            filepath=args.filepath,
+            output_filepath=args.output,
+            max_chunks=args.max_chunks,
+            max_tokens=args.max_tokens,
         )
