@@ -697,7 +697,7 @@ if __name__ == '__main__':
     import sys
     
     if len(sys.argv) == 1:
-        print("Usage: python augument.py <filepath> [options]")
+        print("Usage: python augment.py <filepath> [options]")
         print()
         print("Generate dataset from text file")
         print()
@@ -712,9 +712,9 @@ if __name__ == '__main__':
         print("  --mode MODE          Dataset type: 'facts' for fact distillation or 'active' for active reading (default: active)")
         print()
         print("Examples:")
-        print("  python augument.py data/250304_kangaekata.txt")
-        print("  python augument.py data/text.txt --max-chunks 10 --mode facts")
-        print("  python augument.py data/text.txt --output data/custom.jsonl --mode active")
+        print("  python augment.py data/250304_kangaekata.txt")
+        print("  python augment.py data/text.txt --max-chunks 10 --mode facts")
+        print("  python augment.py data/text.txt --output data/custom.jsonl --mode active")
         sys.exit(0)
     
     parser = argparse.ArgumentParser(description='Generate dataset from text file')

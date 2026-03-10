@@ -21,24 +21,19 @@ p_final = λ * p_MLP + (1 - λ) * p_LM
 ## セットアップ
 
 ```bash
-uv sync
+pipenv install
 ```
 
 外部サービス（QA データ生成に必要）:
 - E5 embedding API — `http://kawarasaki02.info/embedding/e5`（RAG インデックス構築）
-- LLM（いずれか）:
-  - kawarasaki02 Qwen3 API — `http://kawarasaki02.info/llm/query/`
-  - Gemini API（非推奨!! 学習モデルと異なるため正しいLOSS信号が得られない!!）
+- Ollama（ローカル）— QA 生成に使用する LLM
+- Gemini API — `--mode augment` のテキスト拡張に使用
 
-`.env` に設定（`LLM_PROVIDER` で切り替え）:
+`.env` に設定:
 ```
-API_BASE_URL=http://kawarasaki02.info
-
-# kawarasaki02 を使う場合
-LLM_PROVIDER=kawarasaki
-
-# Gemini を使う場合
-LLM_PROVIDER=gemini
+OLLAMA_URL=http://localhost:11434
+QWEN_MODEL=qwen3:14b
+E5_EMBEDDING_URL=http://kawarasaki02.info/embedding/e5
 GEMINI_API_KEY=<your_api_key>
 GEMINI_MODEL=gemini-2.0-flash
 ```
@@ -52,23 +47,40 @@ PDF からテキストを抽出して QA JSONL を生成するまでの一連の
 python test/pdf_to_text.py <URL> [--out data/output.txt]
 ```
 
-### 2. テキスト → QA JSONL（RAG ワークフロー）
+### 2. テキスト拡張（オプション）
+
+QA 生成前にテキストのバリエーションを増やす。Gemini を使用。
 
 ```bash
-# --mode facts（推奨）: チャンク → fact 抽出 → 質問生成 → RAG 回答
-uv run python augument.py data/text.txt --mode facts --max-chunks 100
-
-# --mode active: チャンク → 学習戦略 → active reading QA（MLP 学習には不適）
-uv run python augument.py data/text.txt --mode active --max-chunks 30
+pipenv run python augment.py data/text.txt --mode augment -o data/text_augmented.txt
 ```
 
 | 引数 | 説明 |
 |------|------|
 | `filepath` | 入力テキストファイル |
-| `--mode` | `facts`（RAG ワークフロー・推奨）または `active`（active reading） |
+| `--output`, `-o` | 出力テキストファイルパス（省略時は `data/YYYYMMDDHHMM_<name>_augmented.txt`） |
+| `--max-chunks` | 処理チャンク数の上限 |
+| `--max-tokens`, `-t` | Gemini レスポンスの最大トークン数（デフォルト: 2048） |
+
+各チャンクに対して `permute_sentence`（文順序入れ替え × 3）× `multiply_sentence`（言い換え × 5）を適用し、最大 4 × 6 = 24 バリアントを生成。
+
+### 3. テキスト → QA JSONL（RAG ワークフロー）
+
+```bash
+# --mode facts（推奨）: チャンク → fact 抽出 → 質問生成 → RAG 回答
+pipenv run python augment.py data/text.txt --mode facts --max-chunks 100
+
+# --mode active: チャンク → 学習戦略 → active reading QA（MLP 学習には不適）
+pipenv run python augment.py data/text.txt --mode active --max-chunks 30
+```
+
+| 引数 | 説明 |
+|------|------|
+| `filepath` | 入力テキストファイル |
+| `--mode` | `facts`（RAG ワークフロー・推奨）、`active`（active reading）、`augment`（テキスト拡張） |
 | `--max-chunks` | 処理チャンク数の上限（デフォルト: 先頭から順番） |
 | `--random` | チャンクをランダムサンプリング（省略時は先頭から） |
-| `--output`, `-o` | 出力 JSONL パス（省略時は自動生成） |
+| `--output`, `-o` | 出力ファイルパス（省略時は自動生成） |
 | `--max-tokens`, `-t` | LLM レスポンスの最大トークン数（デフォルト: 2048） |
 
 > **注意**: `--mode active` は学習戦略プロンプトが instruction に混入するため、MLP Memory 学習データには使用しないこと。
@@ -78,12 +90,12 @@ uv run python augument.py data/text.txt --mode active --max-chunks 30
 ### 推論
 
 ```bash
-uv run python mlp.py --mode infer \
+pipenv run python mlp.py --mode infer \
   --model_dir model/YYYYMMDDHHMM_qwen25-05b-instruct-qa \
   --prompt "基準地震動の策定方法について教えてください。"
 
 # Base LM の出力をスキップして MLP Memory のみ出力
-uv run python mlp.py --mode infer \
+pipenv run python mlp.py --mode infer \
   --model_dir model/YYYYMMDDHHMM_qwen25-05b-instruct-qa \
   --skip_base_lm
 ```
@@ -92,7 +104,7 @@ uv run python mlp.py --mode infer \
 
 ```bash
 # QA JSONL から直接学習
-uv run python mlp.py --mode qa-train \
+pipenv run python mlp.py --mode qa-train \
   --qa_path data/qa.jsonl \
   --epochs 20 \
   -m "コメント（必須）"
@@ -101,7 +113,7 @@ uv run python mlp.py --mode qa-train \
 ### 継続学習
 
 ```bash
-uv run python mlp.py --mode qa-train \
+pipenv run python mlp.py --mode qa-train \
   --qa_path data/qa.jsonl \
   --resume_from model/YYYYMMDDHHMM_qwen25-05b-instruct-qa \
   --epochs 10 \
@@ -114,7 +126,7 @@ uv run python mlp.py --mode qa-train \
 
 ```bash
 # 一括実行（qa-knn-build → knn → train → infer）
-uv run python mlp.py --mode qa-knn-full \
+pipenv run python mlp.py --mode qa-knn-full \
   --qa_path data/qa.jsonl \
   -m "コメント（必須）"
 ```
@@ -122,12 +134,12 @@ uv run python mlp.py --mode qa-knn-full \
 ### kNN 学習（コーパス方式）
 
 ```bash
-uv run python mlp.py --mode build --corpus data/corpus.txt
-uv run python mlp.py --mode knn
-uv run python mlp.py --mode train -m "コメント（必須）"
+pipenv run python mlp.py --mode build --corpus data/corpus.txt
+pipenv run python mlp.py --mode knn
+pipenv run python mlp.py --mode train -m "コメント（必須）"
 
 # 一括実行
-uv run python mlp.py --mode full --corpus data/corpus.txt \
+pipenv run python mlp.py --mode full --corpus data/corpus.txt \
   --prompt "基準地震動の策定方法について教えてください。" \
   -m "コメント（必須）"
 ```
@@ -136,10 +148,10 @@ uv run python mlp.py --mode full --corpus data/corpus.txt \
 
 ```bash
 # インデックス構築
-uv run python mlp.py --mode rag-build --qa_path data/qa.jsonl
+pipenv run python mlp.py --mode rag-build --qa_path data/qa.jsonl
 
 # 検索推論
-uv run python mlp.py --mode rag-infer \
+pipenv run python mlp.py --mode rag-infer \
   --prompt "基準地震動の策定方法について教えてください。"
 ```
 
@@ -147,13 +159,13 @@ uv run python mlp.py --mode rag-infer \
 
 ```bash
 # デフォルト λ=[0.6, 0.8, 1.0] で出力を比較
-uv run python test/lambda_survey.py \
+pipenv run python test/lambda_survey.py \
   --model_dir model/YYYYMMDDHHMM_qwen25-05b-instruct-qa \
   --rag_prefix tmp/rag_000155788 \
   --prompt "基準地震動の策定方法について教えてください。"
 
 # 任意の λ 値を指定
-uv run python test/lambda_survey.py \
+pipenv run python test/lambda_survey.py \
   --model_dir model/YYYYMMDDHHMM_... \
   --lambdas 0.6 0.8 1.0
 ```
@@ -227,12 +239,12 @@ P = prompt 長, T = output 長
 
 ```
 mlp.py              # MLP Memory コア実装
-augument.py         # QA データ生成（RAG ワークフロー）
+augment.py         # QA データ生成（RAG ワークフロー）・テキスト拡張（augment モード）
 src/
   config/settings.py    # 環境変数設定（.env から読込）
-  core/llm_client.py    # LLM ルーター（.env の LLM_PROVIDER で切替）
-  llm/gemini.py         # Gemini API クライアント
-  llm/kawarasaki.py     # kawarasaki02 Qwen3 API クライアント
+  core/llm_client.py    # Ollama API クライアント（QA 生成用）
+  llm/gemini.py         # Gemini API クライアント（augment モード用）
+  llm/kawarasaki.py     # kawarasaki02 API クライアント（未使用）
   core/vector_db.py     # FAISS + SQLite3 ベクトル DB
   utils/processors.py   # テキスト処理ユーティリティ
 test/
