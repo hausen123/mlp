@@ -2,10 +2,13 @@
 Lambda interpolation survey.
 Runs inference_mlp over lambda values and writes all outputs to test/lambda_survey_YYYYMMDDHHММ.txt.
 """
+import hashlib
+import json
 import os
 import sys
 import glob
 import argparse
+import tempfile
 import torch
 from datetime import datetime
 from pathlib import Path
@@ -20,15 +23,16 @@ from mlp import (
     MLPMemory,
 )
 
-DEFAULT_LAMBDA_VALUES = [0.6, 0.8, 1.0]
+DEFAULT_LAMBDA_VALUES = [0.2, 0.4, 0.6, 0.8, 1.0]
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--prompt", type=str, default="基準地震動の策定方法について教えてください。")
     parser.add_argument("--model_dir", type=str, default=None)
     parser.add_argument("--lambdas", type=float, nargs="+", default=None)
-    parser.add_argument("--rag_prefix", type=str, default=None, help="RAGインデックスのプレフィックス（省略時はRAGをスキップ）")
-    parser.add_argument("--qa_path", type=str, default=None, help="RAGインデックス構築用 QA JSONL（インデックス未存在時に自動構築）")
+    parser.add_argument("--rag_prefix", type=str, default=None, help="RAGインデックスのプレフィックス（省略時は --qa_path から自動生成）")
+    parser.add_argument("--qa_path", type=str, default=None, help="RAGインデックス構築用 QA JSONL（--rag_prefix 省略時に自動構築）")
+    parser.add_argument("--max_chunks", type=int, default=None, help="RAG構築に使用する最大chunk_id数（省略時はモデルconfigから自動取得）")
     parser.add_argument("--output", "-o", type=str, default=None, help="出力ファイルパス（省略時は自動生成）")
     args = parser.parse_args()
     lambda_values = args.lambdas if args.lambdas is not None else DEFAULT_LAMBDA_VALUES
@@ -54,23 +58,53 @@ def main():
     target_layer_index = mlp.config.target_layer_index
     use_final_layer = getattr(mlp.config, "use_final_layer", False)
     print(f"Target layer: {target_layer_index}, use_final_layer: {use_final_layer}")
+    max_chunks = args.max_chunks
+    if max_chunks is None:
+        max_chunks = (mlp.config.training or {}).get("max_chunks")
     out_path = Path(args.output) if args.output else Path(__file__).parent / f"lambda_survey_{datetime.now().strftime('%Y%m%d%H%M')}.txt"
     lines = []
     lines.append(f"Lambda survey — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     lines.append(f"Model: {save_dir}")
     lines.append(f"Prompt: {args.prompt}")
     lines.append("=" * 60)
-    if args.rag_prefix:
-        index_path = args.rag_prefix + "_rag.index"
+    rag_prefix = args.rag_prefix
+    _tmp_jsonl = None
+    if args.qa_path is not None:
+        qa_path_for_rag = args.qa_path
+        if max_chunks is not None:
+            with open(args.qa_path, encoding="utf-8") as f:
+                all_lines = [json.loads(l) for l in f if l.strip()]
+            seen, ordered_ids = set(), []
+            for item in all_lines:
+                cid = item.get("chunk_id")
+                if cid is not None and cid not in seen:
+                    seen.add(cid)
+                    ordered_ids.append(cid)
+            valid_ids = set(ordered_ids[:max_chunks])
+            filtered = [item for item in all_lines if item.get("chunk_id") in valid_ids]
+            _tmp_fd, _tmp_jsonl = tempfile.mkstemp(suffix=".jsonl", dir="tmp")
+            with os.fdopen(_tmp_fd, "w", encoding="utf-8") as f:
+                for item in filtered:
+                    f.write(json.dumps(item, ensure_ascii=False) + "\n")
+            qa_path_for_rag = _tmp_jsonl
+            print(f"RAG: using {len(filtered)} entries from {len(valid_ids)} chunks (max_chunks={max_chunks})")
+        if rag_prefix is None:
+            _key = args.qa_path + (f"_c{max_chunks}" if max_chunks else "")
+            _h = hashlib.md5(_key.encode()).hexdigest()[:8]
+            rag_prefix = f"tmp/rag_{_h}"
+    if rag_prefix:
+        index_path = rag_prefix + "_rag.index"
         if not os.path.exists(index_path):
             if args.qa_path is None:
                 raise ValueError(f"RAG index not found: {index_path}. Specify --qa_path to build it.")
-            print(f"RAG index not found. Building from {args.qa_path} ...")
-            build_rag_index(model, tokenizer, args.qa_path, args.rag_prefix, device)
+            print(f"RAG index not found. Building from {qa_path_for_rag} ...")
+            build_rag_index(model, tokenizer, qa_path_for_rag, rag_prefix, device)
+        if _tmp_jsonl and os.path.exists(_tmp_jsonl):
+            os.remove(_tmp_jsonl)
         print("\n--- RAG baseline ---")
         try:
             rag_out = inference_rag(
-                model, tokenizer, args.prompt, args.rag_prefix,
+                model, tokenizer, args.prompt, rag_prefix,
                 max_new_tokens=DEFAULT_MAX_NEW_TOKENS,
                 device=device,
             )

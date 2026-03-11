@@ -66,6 +66,8 @@ def parse_args():
     # QA datastore
     parser.add_argument("--qa_path", type=str, default=None,
                         help="QA JSONL ファイル (qa-train/qa-full 時に必須)")
+    parser.add_argument("--max_chunks", type=int, default=None,
+        help="学習に使用する最大chunk_id数（chunk_id付きJSONL必須）。指定すると15チャンクずつセグメント学習")
     parser.add_argument("--max_samples", type=int, default=None,
                         help="QA サンプル数の上限 (省略時は全件)")
     # training
@@ -140,13 +142,14 @@ def load_text_corpus(path, tokenizer, max_length=DEFAULT_MAX_LENGTH):
 # =========================================================
 
 def build_qa_datastore(tokenizer, qa_path, save_prefix,
-                       max_seq_len=2048, max_samples=None):
+                       max_seq_len=2048, max_samples=None, chunk_ids=None):
     """Tokenize QA pairs from JSONL and save as token sequences.
     No LM pass required. Saves:
       save_prefix_qa_plens.npy  - prompt lengths (int32)
       save_prefix_qa_ids.npy   - full token id arrays (object array)
     c_0 = chat-template prefix up to add_generation_prompt end.
     w_0 = first token of output.
+    chunk_ids: if set, only include lines whose chunk_id is in this set.
     """
     os.makedirs(os.path.dirname(save_prefix) or ".", exist_ok=True)
     sequences = []
@@ -155,6 +158,9 @@ def build_qa_datastore(tokenizer, qa_path, save_prefix,
         lines = f.readlines()
     if max_samples is not None:
         lines = lines[:max_samples]
+    if chunk_ids is not None:
+        chunk_ids = set(chunk_ids)
+        lines = [l for l in lines if json.loads(l.strip()).get("chunk_id") in chunk_ids]
     for line in tqdm(lines, desc="Tokenizing QA pairs"):
         line = line.strip()
         if not line:
@@ -582,6 +588,7 @@ def train_mlp(model, save_prefix, device,
             "alpha": alpha,
             "batch_size": batch_size,
             "epochs": epochs,
+            "lr": 4e-4,
             "save_prefix": save_prefix,
             "max_length": max_length,
         },
@@ -665,6 +672,8 @@ def train_mlp_qa(model, tokenizer, qa_path, device,
                  resume_from=None,
                  checkpoint_every=3,
                  max_samples=None,
+                 chunk_size=None,
+                 max_chunks=None,
                  comment=""):
     """Train MLP Memory on QA pairs with online LM inference and CE loss.
     For each batch:
@@ -675,6 +684,164 @@ def train_mlp_qa(model, tokenizer, qa_path, device,
     No kNN / FAISS required.
     """
     import hashlib
+    import datetime
+    # chunk_size が指定されている場合は chunk_id ごとにセグメント分割して順次学習（中間保存なし）
+    if chunk_size is not None:
+        with open(qa_path, encoding="utf-8") as f:
+            all_lines = [json.loads(l) for l in f if l.strip()]
+        seen = set()
+        ordered_chunk_ids = []
+        for item in all_lines:
+            cid = item.get("chunk_id")
+            if cid is not None and cid not in seen:
+                seen.add(cid)
+                ordered_chunk_ids.append(cid)
+        if max_chunks is not None:
+            ordered_chunk_ids = ordered_chunk_ids[:max_chunks]
+        segments = [ordered_chunk_ids[i:i + chunk_size] for i in range(0, len(ordered_chunk_ids), chunk_size)]
+        n_segments = len(segments)
+        print(f"chunk_size={chunk_size}: {len(ordered_chunk_ids)} unique chunk_ids → {n_segments} segments")
+        hidden_dim = model.config.hidden_size
+        embed_weight = model.get_input_embeddings().weight.detach()
+        embed_weight.requires_grad = False
+        config = MLPMemoryConfig(
+            base_model_name=model_name or "",
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            target_layer_index=target_layer_index or 0,
+            use_final_layer=use_final_layer,
+            training={
+                "qa_path": qa_path,
+                "batch_size": batch_size,
+                "epochs": epochs,
+                "lr": 4e-4,
+                "chunk_size": chunk_size,
+                "max_chunks": max_chunks,
+                "resume_from": resume_from,
+            },
+            comment=comment,
+        )
+        if resume_from:
+            _validate_resume(resume_from, hidden_dim, num_layers,
+                             target_layer_index or 0, use_final_layer)
+            mlp = MLPMemory.from_pretrained(resume_from, embed_weight).to(device)
+            print(f"Resumed from {resume_from}")
+        else:
+            mlp = MLPMemory(config, embed_weight).to(device)
+        optimizer = torch.optim.AdamW(mlp.parameters(), lr=4e-4)
+        ckpt_dir = _make_ckpt_dir((model_name or "mlp-memory") + "-qa") if checkpoint_every > 0 else None
+        train_start = time.time()
+        total_loss = 0.0
+        n_batches = 0
+        for seg_idx, seg_chunk_ids in enumerate(segments):
+            seg_ids = set(seg_chunk_ids)
+            seg_lines = [item for item in all_lines if item.get("chunk_id") in seg_ids]
+            _cache_key = hashlib.md5(qa_path.encode()).hexdigest()[:8]
+            _seg_key = hashlib.md5(str(sorted(seg_chunk_ids)).encode()).hexdigest()[:6]
+            _cache_prefix = f"tmp/.qa_cache_{_cache_key}_seg{_seg_key}"
+            import tempfile, os as _os
+            _tmp_path = f"{_cache_prefix}_tmp.jsonl"
+            with open(_tmp_path, "w", encoding="utf-8") as f:
+                for item in seg_lines:
+                    f.write(json.dumps(item, ensure_ascii=False) + "\n")
+            build_qa_datastore(tokenizer, _tmp_path, _cache_prefix)
+            _os.remove(_tmp_path)
+            prompt_lens = np.load(_cache_prefix + "_qa_plens.npy")
+            full_ids_arr = np.load(_cache_prefix + "_qa_ids.npy", allow_pickle=True)
+            sequences = list(zip(prompt_lens.tolist(), full_ids_arr))
+            indices = list(range(len(sequences)))
+            print(f"\n=== Segment {seg_idx+1}/{n_segments}: chunk_ids {seg_chunk_ids[0]}–{seg_chunk_ids[-1]} ({len(sequences)} samples) ===")
+            for epoch in range(epochs):
+                epoch_start = time.time()
+                random.shuffle(indices)
+                epoch_loss = 0.0
+                epoch_batches = 0
+                model.eval()
+                mlp.train()
+                for batch_start in tqdm(
+                    range(0, len(indices), batch_size),
+                    desc=f"Seg {seg_idx+1}/{n_segments} Epoch {epoch+1}/{epochs}"
+                ):
+                    batch_idx = indices[batch_start:batch_start + batch_size]
+                    batch_seqs = [sequences[i] for i in batch_idx]
+                    batch_seqs = sorted(batch_seqs, key=lambda x: len(x[1]), reverse=True)
+                    max_len = len(batch_seqs[0][1])
+                    input_ids_list = []
+                    attn_mask_list = []
+                    for P, full_ids in batch_seqs:
+                        ids = torch.tensor(full_ids, dtype=torch.long)
+                        pad_len = max_len - len(ids)
+                        padded = F.pad(ids, (0, pad_len), value=0)
+                        mask = torch.cat([
+                            torch.ones(len(ids), dtype=torch.long),
+                            torch.zeros(pad_len, dtype=torch.long),
+                        ])
+                        input_ids_list.append(padded)
+                        attn_mask_list.append(mask)
+                    input_ids_batch = torch.stack(input_ids_list).to(device)
+                    attn_mask_batch = torch.stack(attn_mask_list).to(device)
+                    with torch.no_grad():
+                        outputs = model(
+                            input_ids=input_ids_batch,
+                            attention_mask=attn_mask_batch,
+                            output_hidden_states=True,
+                            logits_to_keep=1,
+                        )
+                    hidden = outputs.hidden_states[target_layer_index].float()
+                    if use_final_layer:
+                        hidden = hidden + outputs.hidden_states[-1].float()
+                    del outputs
+                    torch.cuda.empty_cache()
+                    all_keys = []
+                    all_vals = []
+                    for i, (P, full_ids) in enumerate(batch_seqs):
+                        T = len(full_ids) - P
+                        if T < 1:
+                            continue
+                        keys = hidden[i, P - 1:P + T - 1, :]
+                        vals = torch.tensor(full_ids[P:P + T], dtype=torch.long)
+                        all_keys.append(keys)
+                        all_vals.append(vals)
+                    del hidden
+                    if not all_keys:
+                        continue
+                    keys_cat = torch.cat(all_keys, dim=0)
+                    vals_cat = torch.cat(all_vals, dim=0).to(device)
+                    N = len(keys_cat)
+                    optimizer.zero_grad()
+                    accum_loss = 0.0
+                    for t in range(0, N, max_tokens_per_step):
+                        k = keys_cat[t:t + max_tokens_per_step]
+                        v = vals_cat[t:t + max_tokens_per_step]
+                        sub_loss = F.cross_entropy(mlp(k), v) * (len(k) / N)
+                        sub_loss.backward()
+                        accum_loss += sub_loss.item()
+                    optimizer.step()
+                    epoch_loss += accum_loss
+                    epoch_batches += 1
+                total_loss += epoch_loss
+                n_batches += epoch_batches
+                epoch_elapsed = time.time() - epoch_start
+                total_elapsed = time.time() - train_start
+                segs_done = seg_idx * epochs + epoch + 1
+                segs_total = n_segments * epochs
+                eta_sec = (total_elapsed / segs_done) * (segs_total - segs_done) if segs_done > 0 else 0
+                eta_str = (datetime.datetime.now() + datetime.timedelta(seconds=eta_sec)).strftime("%H:%M")
+                mem_gb = torch.cuda.memory_reserved() / 1e9 if torch.cuda.is_available() else 0
+                print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] "
+                      f"Seg {seg_idx+1}/{n_segments} Epoch {epoch+1}/{epochs} "
+                      f"loss={epoch_loss / max(epoch_batches, 1):.4f} "
+                      f"epoch={epoch_elapsed:.0f}s total={total_elapsed/60:.1f}min "
+                      f"ETA={eta_str} GPU={mem_gb:.1f}GB")
+                if ckpt_dir and (epoch + 1) % checkpoint_every == 0:
+                    mlp.save_pretrained(ckpt_dir)
+                    print(f"Checkpoint saved to {ckpt_dir}")
+        final_loss = total_loss / max(n_batches, 1)
+        save_dir = _make_save_dir((model_name or "mlp-memory") + "-qa")
+        mlp.config.training["final_loss"] = round(final_loss, 6)
+        mlp.save_pretrained(save_dir)
+        print(f"Saved to {save_dir}")
+        return mlp, save_dir
     _cache_key = hashlib.md5(qa_path.encode()).hexdigest()[:8]
     _cache_prefix = f"tmp/.qa_cache_{_cache_key}"
     build_qa_datastore(tokenizer, qa_path, _cache_prefix, max_samples=max_samples)
@@ -694,6 +861,7 @@ def train_mlp_qa(model, tokenizer, qa_path, device,
             "qa_path": qa_path,
             "batch_size": batch_size,
             "epochs": epochs,
+            "lr": 4e-4,
             "resume_from": resume_from,
         },
         comment=comment,
@@ -1059,6 +1227,8 @@ def main():
             resume_from=args.resume_from,
             checkpoint_every=args.checkpoint_every,
             max_samples=args.max_samples,
+            chunk_size=15 if args.max_chunks else None,
+            max_chunks=args.max_chunks,
             comment=args.comment,
         )
     # --- QA kNN workflow ---
