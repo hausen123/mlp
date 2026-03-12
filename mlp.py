@@ -85,6 +85,8 @@ def parse_args():
     parser.add_argument("--prompt", type=str,
                         default="Transformerの仕組みを説明してください。")
     parser.add_argument("--max_new_tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
+    parser.add_argument("--temperature", type=float, default=0.2,
+                        help="サンプリング温度（Base LM・MLP Memory 共通）")
     parser.add_argument("--skip_base_lm", action="store_true",
                         help="推論時に Base LM の出力をスキップする")
     parser.add_argument("--use_final_layer", action="store_true",
@@ -504,9 +506,9 @@ class MLPBlock(nn.Module):
         super().__init__()
         self.norm = nn.LayerNorm(hidden_dim)
         self.ff = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.Linear(hidden_dim, hidden_dim * 4),
             nn.GELU(),
-            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.Linear(hidden_dim * 4, hidden_dim),
         )
     def forward(self, x):
         return x + self.ff(self.norm(x))
@@ -1021,7 +1023,8 @@ def build_rag_index(model, tokenizer, qa_path, rag_prefix, device, batch_size=51
 def inference_rag(model, tokenizer, query, rag_prefix,
                   k=DEFAULT_RAG_K,
                   max_new_tokens=DEFAULT_MAX_NEW_TOKENS,
-                  device="cpu"):
+                  device="cpu",
+                  temperature=0.2):
     """RAG 推論: E5 embedding で top-k QA ペアを検索してシステムプロンプトに付与し生成する。"""
     index = faiss.read_index(rag_prefix + "_rag.index")
     records = np.load(rag_prefix + "_rag_meta.npy", allow_pickle=True)
@@ -1043,7 +1046,7 @@ def inference_rag(model, tokenizer, query, rag_prefix,
             **inputs,
             max_new_tokens=max_new_tokens,
             do_sample=True,
-            temperature=0.7,
+            temperature=temperature,
             top_p=0.8,
             top_k=20,
             repetition_penalty=1.1,
@@ -1056,7 +1059,8 @@ def inference_rag(model, tokenizer, query, rag_prefix,
 # =========================================================
 
 def inference(model, tokenizer, prompt,
-              max_new_tokens=DEFAULT_MAX_NEW_TOKENS, device="cpu"):
+              max_new_tokens=DEFAULT_MAX_NEW_TOKENS, device="cpu",
+              temperature=0.2):
     model.eval()
     messages = [{"role": "user", "content": prompt}]
     text = tokenizer.apply_chat_template(
@@ -1068,7 +1072,7 @@ def inference(model, tokenizer, prompt,
             **inputs,
             max_new_tokens=max_new_tokens,
             do_sample=True,
-            temperature=0.7,
+            temperature=temperature,
             top_p=0.8,
             top_k=20,
             repetition_penalty=1.1,
@@ -1090,7 +1094,7 @@ def inference_mlp(model, tokenizer, mlp,
                   max_new_tokens=DEFAULT_MAX_NEW_TOKENS,
                   device="cpu",
                   repetition_penalty=1.1,
-                  temperature=0.7,
+                  temperature=0.2,
                   top_p=0.8,
                   top_k=20,
                   use_final_layer=False):
@@ -1271,6 +1275,7 @@ def main():
             k=args.rag_k,
             max_new_tokens=args.max_new_tokens,
             device=device,
+            temperature=args.temperature,
         )
         print(result)
         print("\n--- Retrieved QA pairs ---")
@@ -1293,14 +1298,16 @@ def main():
         if not args.skip_base_lm:
             print("\n=== Base LM ===")
             print(inference(model, tokenizer,
-                            args.prompt, args.max_new_tokens, device))
+                            args.prompt, args.max_new_tokens, device,
+                            temperature=args.temperature))
         use_final_layer = getattr(mlp.config, "use_final_layer", False)
         print("\n=== MLP Memory ===")
         print(inference_mlp(model, tokenizer,
                             mlp, args.prompt,
                             target_layer_index, lambda_interp,
                             args.max_new_tokens, device,
-                            use_final_layer=use_final_layer))
+                            use_final_layer=use_final_layer,
+                            temperature=args.temperature))
 
 
 if __name__ == "__main__":
