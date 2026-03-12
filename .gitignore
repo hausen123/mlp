@@ -10,6 +10,5 @@ __pycache__/
 *.npy
 *.pt
 *.safetensors
-*.txt
-*.pdf
+
 model/
