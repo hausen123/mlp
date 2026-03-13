@@ -29,7 +29,7 @@ DEFAULT_TAU = 1.0
 DEFAULT_ALPHA = 0.4
 DEFAULT_LAMBDA_INTERP = 0.45
 DEFAULT_MAX_NEW_TOKENS = 1024
-DEFAULT_NUM_LAYERS = 22
+DEFAULT_NUM_LAYERS = None
 DEFAULT_RAG_K = 3
 
 # =========================================================
@@ -75,6 +75,7 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
     parser.add_argument("--lambda_interp", type=float, default=DEFAULT_LAMBDA_INTERP)
     parser.add_argument("--num_layers", type=int, default=DEFAULT_NUM_LAYERS)
+    parser.add_argument("--target_layer_ratio", type=float, default=0.7)
     parser.add_argument("--max_tokens_per_step", type=int, default=2048,
                         help="MLP forward/backward のトークン上限（QA学習時のOOM防止）")
     parser.add_argument("--max_tokens_per_batch", type=int, default=16384,
@@ -1185,8 +1186,10 @@ def main():
         )
         model.eval()
         num_layers = model.config.num_hidden_layers
-        target_layer_index = int(num_layers * 0.7)
-        print(f"Target layer: {target_layer_index} / {num_layers}")
+        target_layer_index = int(num_layers * args.target_layer_ratio)
+        if args.num_layers is None:
+            args.num_layers = num_layers - target_layer_index
+        print(f"Target layer: {target_layer_index} / {num_layers}, M={args.num_layers}")
     # --- kNN workflow ---
     if args.mode in ["build", "full"]:
         build_datastore(

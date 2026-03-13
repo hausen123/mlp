@@ -184,7 +184,8 @@ pipenv run python test/lambda_survey.py \
 | `--rag_prefix` | `tmp/rag` | RAG インデックスのプレフィックス |
 | `--epochs` | `20` | 訓練エポック数 |
 | `--batch_size` | `64` | 訓練バッチサイズ |
-| `--num_layers` | `22` | MLP の残差ブロック数 |
+| `--num_layers` | 自動 | MLP の残差ブロック数（省略時: `num_hidden_layers - target_layer_index`） |
+| `--target_layer_ratio` | `0.7` | `target_layer_index = int(num_hidden_layers * ratio)` |
 | `--lambda_interp` | `0.45` | 推論時の MLP 補間係数 |
 | `--max_new_tokens` | `1024` | 推論時の最大生成トークン数 |
 | `--skip_base_lm` | `False` | 推論時に Base LM の出力をスキップ |
@@ -223,7 +224,8 @@ for _ in range(M):
 logits = h @ embed_weight.T
 ```
 
-- target layer: `int(num_hidden_layers * 0.7)` = layer 16（24層モデル）
+- target layer: `int(num_hidden_layers * --target_layer_ratio)` = layer 16（24層モデル、ratio=0.7）
+- デフォルト M: `num_hidden_layers - target_layer_index` = 8（24層モデル）
 - `--use_final_layer` 指定時: `h = h_layer16 + h_final`
 - embed_weight は凍結
 
