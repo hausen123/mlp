@@ -88,6 +88,8 @@ def parse_args():
     parser.add_argument("--max_new_tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
     parser.add_argument("--temperature", type=float, default=0.2,
                         help="サンプリング温度（Base LM・MLP Memory 共通）")
+    parser.add_argument("--load_in_4bit", action="store_true",
+                        help="BitsAndBytes 4-bit量子化でベースモデルをロード")
     parser.add_argument("--skip_base_lm", action="store_true",
                         help="推論時に Base LM の出力をスキップする")
     parser.add_argument("--use_final_layer", action="store_true",
@@ -664,6 +666,40 @@ def train_mlp(model, save_prefix, device,
 # QA Training (CE loss only, no kNN / FAISS)
 # =========================================================
 
+def _extract_hidden_hook(model, input_ids, attn_mask, target_layer_index, use_final_layer):
+    """Forward hookでtarget層と最終層のhidden statesのみ取得（全層保持を回避）。
+    hidden_states[i] = layers[i-1]の出力 (i=0はembedding) なので
+    target_layer_index に対応するのは layers[target_layer_index - 1]。
+    """
+    layers = model.model.layers
+    captured = {}
+    handles = []
+    def make_hook(key):
+        def hook(module, input, output):
+            tensor = output if isinstance(output, torch.Tensor) else output[0]
+            captured[key] = tensor.detach()
+        return hook
+    handles.append(layers[target_layer_index - 1].register_forward_hook(make_hook("target")))
+    if use_final_layer and target_layer_index - 1 != len(layers) - 1:
+        handles.append(layers[-1].register_forward_hook(make_hook("final")))
+    with torch.no_grad():
+        model(
+            input_ids=input_ids,
+            attention_mask=attn_mask,
+            output_hidden_states=False,
+            logits_to_keep=1,
+        )
+    for h in handles:
+        h.remove()
+    hidden = captured["target"].float()
+    if use_final_layer:
+        # hidden_states[-1] はfinal norm適用後なのでhookのpre-norm出力に合わせてnormを適用
+        final_pre = captured.get("final", captured["target"])
+        with torch.no_grad():
+            final_normed = model.model.norm(final_pre).float()
+        hidden = hidden + final_normed
+    return hidden
+
 def train_mlp_qa(model, tokenizer, qa_path, device,
                  model_name=None,
                  target_layer_index=None,
@@ -783,17 +819,10 @@ def train_mlp_qa(model, tokenizer, qa_path, device,
                         attn_mask_list.append(mask)
                     input_ids_batch = torch.stack(input_ids_list).to(device)
                     attn_mask_batch = torch.stack(attn_mask_list).to(device)
-                    with torch.no_grad():
-                        outputs = model(
-                            input_ids=input_ids_batch,
-                            attention_mask=attn_mask_batch,
-                            output_hidden_states=True,
-                            logits_to_keep=1,
-                        )
-                    hidden = outputs.hidden_states[target_layer_index].float()
-                    if use_final_layer:
-                        hidden = hidden + outputs.hidden_states[-1].float()
-                    del outputs
+                    hidden = _extract_hidden_hook(
+                        model, input_ids_batch, attn_mask_batch,
+                        target_layer_index, use_final_layer,
+                    )
                     torch.cuda.empty_cache()
                     all_keys = []
                     all_vals = []
@@ -913,17 +942,10 @@ def train_mlp_qa(model, tokenizer, qa_path, device,
                 attn_mask_list.append(mask)
             input_ids_batch = torch.stack(input_ids_list).to(device)
             attn_mask_batch = torch.stack(attn_mask_list).to(device)
-            with torch.no_grad():
-                outputs = model(
-                    input_ids=input_ids_batch,
-                    attention_mask=attn_mask_batch,
-                    output_hidden_states=True,
-                    logits_to_keep=1,
-                )
-            hidden = outputs.hidden_states[target_layer_index].float()  # [B, max_len, H]
-            if use_final_layer:
-                hidden = hidden + outputs.hidden_states[-1].float()
-            del outputs
+            hidden = _extract_hidden_hook(
+                model, input_ids_batch, attn_mask_batch,
+                target_layer_index, use_final_layer,
+            )
             torch.cuda.empty_cache()
             all_keys = []
             all_vals = []
@@ -1171,6 +1193,15 @@ def main():
     if args.mode in ["train", "full", "qa-train", "qa-full", "qa-knn-full"] and not args.comment:
         raise ValueError("-m/--comment is required for training modes")
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    if args.mode in ["infer"] and args.model_dir:
+        _cfg_path = os.path.join(args.model_dir, "config.json")
+        if os.path.exists(_cfg_path):
+            with open(_cfg_path) as _f:
+                _cfg = json.load(_f)
+            _base = _cfg.get("base_model_name", "")
+            if _base:
+                args.model_name = _base
+                print(f"base_model_name (from model_dir): {_base}")
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_name, trust_remote_code=True
     )
@@ -1179,11 +1210,11 @@ def main():
     model = None
     target_layer_index = None
     if need_model:
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model_name,
-            dtype=torch.float16 if device == "cuda" else torch.float32,
-            device_map="auto",
-        )
+        load_kwargs = dict(torch_dtype="auto", device_map="auto")
+        if args.load_in_4bit:
+            from transformers import BitsAndBytesConfig
+            load_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_4bit=True)
+        model = AutoModelForCausalLM.from_pretrained(args.model_name, **load_kwargs)
         model.eval()
         num_layers = model.config.num_hidden_layers
         target_layer_index = int(num_layers * args.target_layer_ratio)
