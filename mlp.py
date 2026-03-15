@@ -15,6 +15,10 @@ from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
 from safetensors.torch import save_file, load_file
 from transformers import AutoTokenizer, AutoModelForCausalLM, PretrainedConfig
+try:
+    import bitsandbytes as bnb
+except ImportError:
+    bnb = None
 
 # =========================================================
 # Defaults
@@ -606,7 +610,12 @@ def train_mlp(model, save_prefix, device,
         print(f"Resumed from {resume_from}")
     else:
         mlp = MLPMemory(config, embed_weight).to(device)
-    optimizer = torch.optim.AdamW(mlp.parameters(), lr=4e-4)
+    if bnb is not None:
+        optimizer = bnb.optim.AdamW8bit(mlp.parameters(), lr=4e-4)
+        print("Optimizer: AdamW8bit (bitsandbytes)")
+    else:
+        optimizer = torch.optim.AdamW(mlp.parameters(), lr=4e-4)
+        print("Optimizer: AdamW (fp32, bitsandbytes not installed)")
     ckpt_dir = _make_ckpt_dir(model_name or "mlp-memory") if checkpoint_every > 0 else None
     if ckpt_dir:
         print(f"Checkpoint dir: {ckpt_dir}")
@@ -767,7 +776,12 @@ def train_mlp_qa(model, tokenizer, qa_path, device,
             print(f"Resumed from {resume_from}")
         else:
             mlp = MLPMemory(config, embed_weight).to(device)
-        optimizer = torch.optim.AdamW(mlp.parameters(), lr=4e-4)
+        if bnb is not None:
+            optimizer = bnb.optim.AdamW8bit(mlp.parameters(), lr=4e-4)
+            print("Optimizer: AdamW8bit (bitsandbytes)")
+        else:
+            optimizer = torch.optim.AdamW(mlp.parameters(), lr=4e-4)
+            print("Optimizer: AdamW (fp32, bitsandbytes not installed)")
         ckpt_dir = _make_ckpt_dir((model_name or "mlp-memory") + "-qa") if checkpoint_every > 0 else None
         train_start = time.time()
         total_loss = 0.0
@@ -905,7 +919,12 @@ def train_mlp_qa(model, tokenizer, qa_path, device,
         print(f"Resumed from {resume_from}")
     else:
         mlp = MLPMemory(config, embed_weight).to(device)
-    optimizer = torch.optim.AdamW(mlp.parameters(), lr=4e-4)
+    if bnb is not None:
+        optimizer = bnb.optim.AdamW8bit(mlp.parameters(), lr=4e-4)
+        print("Optimizer: AdamW8bit (bitsandbytes)")
+    else:
+        optimizer = torch.optim.AdamW(mlp.parameters(), lr=4e-4)
+        print("Optimizer: AdamW (fp32, bitsandbytes not installed)")
     ckpt_dir = _make_ckpt_dir((model_name or "mlp-memory") + "-qa") if checkpoint_every > 0 else None
     if ckpt_dir:
         print(f"Checkpoint dir: {ckpt_dir}")
