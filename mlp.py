@@ -98,6 +98,8 @@ def parse_args():
                         help="推論時に Base LM の出力をスキップする")
     parser.add_argument("--use_final_layer", action="store_true",
                         help="70%%層に加えて最終隠れ層も足し合わせて MLP に入力する")
+    parser.add_argument("--use_8bit_adam", action="store_true",
+                        help="bitsandbytes AdamW8bit を使用（VRAM削減、要bitsandbytes）")
     parser.add_argument("--resume_from", type=str, default=None,
                         help="継続学習するモデルディレクトリ（アーキテクチャが一致しない場合はエラー）")
     parser.add_argument("-m", "--comment", type=str, default=None,
@@ -573,6 +575,7 @@ def train_mlp(model, save_prefix, device,
               max_length=DEFAULT_MAX_LENGTH,
               num_layers=DEFAULT_NUM_LAYERS,
               use_final_layer=False,
+              use_8bit_adam=False,
               resume_from=None,
               checkpoint_every=3,
               comment=""):
@@ -610,12 +613,12 @@ def train_mlp(model, save_prefix, device,
         print(f"Resumed from {resume_from}")
     else:
         mlp = MLPMemory(config, embed_weight).to(device)
-    if bnb is not None:
+    if use_8bit_adam and bnb is not None:
         optimizer = bnb.optim.AdamW8bit(mlp.parameters(), lr=4e-4)
         print("Optimizer: AdamW8bit (bitsandbytes)")
     else:
         optimizer = torch.optim.AdamW(mlp.parameters(), lr=4e-4)
-        print("Optimizer: AdamW (fp32, bitsandbytes not installed)")
+        print("Optimizer: AdamW (fp32)")
     ckpt_dir = _make_ckpt_dir(model_name or "mlp-memory") if checkpoint_every > 0 else None
     if ckpt_dir:
         print(f"Checkpoint dir: {ckpt_dir}")
@@ -717,6 +720,7 @@ def train_mlp_qa(model, tokenizer, qa_path, device,
                  num_layers=DEFAULT_NUM_LAYERS,
                  max_tokens_per_step=2048,
                  use_final_layer=False,
+                 use_8bit_adam=False,
                  resume_from=None,
                  checkpoint_every=3,
                  max_samples=None,
@@ -776,12 +780,12 @@ def train_mlp_qa(model, tokenizer, qa_path, device,
             print(f"Resumed from {resume_from}")
         else:
             mlp = MLPMemory(config, embed_weight).to(device)
-        if bnb is not None:
+        if use_8bit_adam and bnb is not None:
             optimizer = bnb.optim.AdamW8bit(mlp.parameters(), lr=4e-4)
             print("Optimizer: AdamW8bit (bitsandbytes)")
         else:
             optimizer = torch.optim.AdamW(mlp.parameters(), lr=4e-4)
-            print("Optimizer: AdamW (fp32, bitsandbytes not installed)")
+            print("Optimizer: AdamW (fp32)")
         ckpt_dir = _make_ckpt_dir((model_name or "mlp-memory") + "-qa") if checkpoint_every > 0 else None
         train_start = time.time()
         total_loss = 0.0
@@ -919,12 +923,12 @@ def train_mlp_qa(model, tokenizer, qa_path, device,
         print(f"Resumed from {resume_from}")
     else:
         mlp = MLPMemory(config, embed_weight).to(device)
-    if bnb is not None:
+    if use_8bit_adam and bnb is not None:
         optimizer = bnb.optim.AdamW8bit(mlp.parameters(), lr=4e-4)
         print("Optimizer: AdamW8bit (bitsandbytes)")
     else:
         optimizer = torch.optim.AdamW(mlp.parameters(), lr=4e-4)
-        print("Optimizer: AdamW (fp32, bitsandbytes not installed)")
+        print("Optimizer: AdamW (fp32)")
     ckpt_dir = _make_ckpt_dir((model_name or "mlp-memory") + "-qa") if checkpoint_every > 0 else None
     if ckpt_dir:
         print(f"Checkpoint dir: {ckpt_dir}")
@@ -1266,6 +1270,7 @@ def main():
             max_length=args.max_length,
             num_layers=args.num_layers,
             use_final_layer=args.use_final_layer,
+            use_8bit_adam=args.use_8bit_adam,
             resume_from=args.resume_from,
             checkpoint_every=args.checkpoint_every,
             comment=args.comment,
@@ -1281,6 +1286,7 @@ def main():
             num_layers=args.num_layers,
             max_tokens_per_step=args.max_tokens_per_step,
             use_final_layer=args.use_final_layer,
+            use_8bit_adam=args.use_8bit_adam,
             resume_from=args.resume_from,
             checkpoint_every=args.checkpoint_every,
             max_samples=args.max_samples,
@@ -1312,6 +1318,7 @@ def main():
             tau=args.tau,
             num_layers=args.num_layers,
             use_final_layer=args.use_final_layer,
+            use_8bit_adam=args.use_8bit_adam,
             resume_from=args.resume_from,
             checkpoint_every=args.checkpoint_every,
             comment=args.comment,

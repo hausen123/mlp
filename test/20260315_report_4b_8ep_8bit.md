@@ -50,10 +50,10 @@ pipenv run python mlp.py \
   --mode infer \
   --model_dir model/202603151232_qwen3-4b-instruct-2507-qa \
   --lambda_interp 0.8 \
+  --temperature 0.2 \
+  --skip_base_lm \
   --prompt "原子力規制委員会の独立性について説明してください。"
 ```
-
-※ `--model_name` 不要（model_dir/config.json の base_model_name を自動参照）
 
 ### プロンプト
 「原子力規制委員会の独立性について説明してください。」
